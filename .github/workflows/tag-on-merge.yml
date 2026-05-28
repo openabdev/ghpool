@@ -12,15 +12,24 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Generate App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@v6
+        with:
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Create and push tag
         run: |
           # release/v0.2.0 → v0.2.0
           VERSION="${GITHUB_HEAD_REF#release/}"
           if [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git config user.name "openab-app[bot]"
+            git config user.email "274185012+openab-app[bot]@users.noreply.github.com"
             git tag "$VERSION"
             git push origin "$VERSION"
             echo "::notice::Tagged ${VERSION}"

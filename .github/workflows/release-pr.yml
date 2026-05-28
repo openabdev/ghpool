@@ -15,8 +15,16 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      - name: Generate App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
       - uses: actions/checkout@v6
         with:
+          token: ${{ steps.app-token.outputs.token }}
           fetch-depth: 0
 
       - name: Resolve version
@@ -41,12 +49,12 @@ jobs:
 
       - name: Create release PR
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           BRANCH="release/v${VERSION}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "openab-app[bot]"
+          git config user.email "274185012+openab-app[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
           git add -A
           git diff --cached --quiet && git commit --allow-empty -m "release: v${VERSION}" || git commit -m "release: v${VERSION}"
