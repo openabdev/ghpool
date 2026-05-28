@@ -49,7 +49,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
           git add -A
-          git commit -m "release: v${VERSION}"
+          git diff --cached --quiet && git commit --allow-empty -m "release: v${VERSION}" || git commit -m "release: v${VERSION}"
           git push origin "$BRANCH"
           gh pr create \
             --title "release: v${VERSION}" \
