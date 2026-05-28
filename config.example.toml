@@ -1,6 +1,6 @@
 port = 8080
 
-allowed_owners = ["openclaw", "openabdev", "7iac"]
+allowed_owners = ["openclaw", "openabdev"]
 
 # Token formats:
 #   "ghp_xxx"                                    — plain literal
