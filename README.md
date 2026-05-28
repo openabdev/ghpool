@@ -1,21 +1,30 @@
 # ghpool
 
-Internal GitHub API proxy with PAT pooling and caching. Designed to run as a shared service for multiple coding agents that need to read from the same GitHub repos without exhausting individual rate limits.
+Internal GitHub API proxy with PAT pooling and caching. Open source, designed for enterprise.
+
+## Design Principles
+
+- **Cloud-native** — runs on any Kubernetes (Amazon EKS, Google Cloud GKE, self-managed k8s) and Amazon ECS. Single static binary, no runtime dependencies.
+- **Built for agents, not humans** — optimized for high-throughput, concurrent API access from multiple coding agents sharing the same repos.
+- **Secrets-first** — credentials are resolved at runtime from AWS Secrets Manager, Kubernetes secrets, or environment variables. No plain text tokens stored at rest or in transit.
+- **Private network isolation** — designed to run inside your trusted network (on-premises, cloud VPC, or service mesh). No public endpoints, no external dependencies beyond GitHub API.
 
 ## What it does
 
-- Pools multiple GitHub PATs and routes each request through the identity with the most remaining rate limit budget
-- Caches GitHub API responses in memory with configurable TTLs per route type
+- Pools multiple GitHub PATs and routes each read request through the identity with the most remaining rate limit budget
+- Caches GitHub REST and GraphQL query responses in memory with configurable TTLs
+- Proxies GraphQL mutations with passthrough auth (client's own token, no caching)
 - Mirrors the GitHub API path structure — clients just change the base URL
 - Restricts access to configured org/owner repos only
+- Auto-resolves GitHub username from tokens for audit logging
 
 ## Quick start
 
 ```sh
-cp config.example.yaml config.yaml
-# Edit config.yaml with your PATs and allowed owners
+cp config.example.toml config.toml
+# Edit config.toml with your PATs and allowed owners
 
-cargo run
+cargo run --release
 # Listening on 0.0.0.0:8080
 
 curl http://localhost:8080/repos/openclaw/chi/pulls/123
@@ -24,11 +33,72 @@ curl http://localhost:8080/stats
 
 ## Configuration
 
-### YAML file
+### TOML file
 
-Set `GHPOOL_CONFIG` env var to point to your config file (defaults to `config.yaml`).
+Set `GHPOOL_CONFIG` env var to point to your config file (defaults to `config.toml`).
 
-See [config.example.yaml](config.example.yaml) for all options.
+See [config.example.toml](config.example.toml) for all options.
+
+### Secret references
+
+The `token` field in `[[identities]]` supports multiple secret sources, so credentials never need to exist in plain text on disk:
+
+| Format | Source |
+|--------|--------|
+| `ghp_xxx...` | Plain literal (local dev only) |
+| `env:VAR_NAME` | Environment variable |
+| `aws:secretsmanager:secret-name:json-key` | AWS Secrets Manager |
+| `k8s:namespace/secret-name:key` | Kubernetes secret (mounted volume) |
+
+#### AWS Secrets Manager
+
+Store PATs as a JSON object in a single secret:
+
+```sh
+aws secretsmanager create-secret --name ghpool/pats \
+  --secret-string '{"pat_alice":"ghp_xxx","pat_bob":"ghp_yyy"}'
+```
+
+```toml
+[[identities]]
+id = "alice"
+token = "aws:secretsmanager:ghpool/pats:pat_alice"
+```
+
+ghpool uses the standard AWS credential chain (instance profile, ECS task role, SSO, env vars).
+
+#### Google Cloud Secret Manager (planned)
+
+```toml
+[[identities]]
+id = "alice"
+token = "gcp:secretmanager:projects/my-proj/secrets/ghpool-pat:latest"
+```
+
+GCP support is on the roadmap. Contributions welcome.
+
+#### Kubernetes Secrets
+
+Mount your secret as a volume at `/etc/secrets/` and reference it:
+
+```yaml
+# K8s Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ghpool-pats
+  namespace: default
+stringData:
+  pat_alice: ghp_xxx
+```
+
+```toml
+[[identities]]
+id = "alice"
+token = "k8s:default/ghpool-pats:pat_alice"
+```
+
+Works with any Kubernetes distribution — EKS, GKE, AKS, k3s, or self-managed.
 
 ### Environment variables only
 
@@ -47,7 +117,7 @@ PATs are discovered from any env var matching `GHPOOL_PAT_<ID>=<token>`.
 
 ```sh
 docker build -t ghpool .
-docker run -p 8080:8080 -v ./config.yaml:/config.yaml ghpool
+docker run -p 8080:8080 -v ./config.toml:/config.toml ghpool
 ```
 
 ### ECS (Service Connect)
@@ -66,13 +136,26 @@ http://ghpool.<namespace>.svc.cluster.local:8080/repos/owner/repo/pulls/123
 
 ## API
 
-All GitHub API GET paths are proxied transparently:
+### REST (GET)
+
+All GitHub REST API GET paths are proxied transparently with PAT pooling and caching:
 
 ```
 GET /<github-api-path>
 ```
 
-Additional endpoints:
+### GraphQL (POST /graphql)
+
+```
+POST /graphql
+```
+
+- **Queries** — routed through pooled PATs, responses cached
+- **Mutations** — client's own `Authorization` header passed through to GitHub (no pooling, no caching)
+
+If a mutation request has no `Authorization` header, ghpool returns `401`.
+
+### Management
 
 | Path | Description |
 |------|-------------|
@@ -81,14 +164,39 @@ Additional endpoints:
 
 ## How clients use it
 
-Set the GitHub API base URL to point at ghpool instead of `api.github.com`:
+### gh CLI
 
 ```sh
-# Direct curl
-curl http://ghpool:8080/repos/org/repo/pulls/123
+export GITHUB_API_URL=http://localhost:8080
+export GITHUB_GRAPHQL_URL=http://localhost:8080/graphql
+```
 
-# In agent code — just change base URL
-export GITHUB_API_BASE=http://ghpool:8080
+All `gh` commands work transparently — reads are pooled+cached, writes use your own auth.
+
+### Coding agents
+
+Set the GitHub API base URL to point at ghpool:
+
+```sh
+export GITHUB_API_BASE=http://localhost:8080
+```
+
+### Direct curl
+
+```sh
+# REST
+curl http://localhost:8080/repos/org/repo/pulls/123
+
+# GraphQL query
+curl -X POST http://localhost:8080/graphql \
+  -H "Content-Type: application/json" \
+  -d '{"query":"query { repository(owner:\"org\", name:\"repo\") { stargazerCount }}"}'
+
+# GraphQL mutation (requires your own auth)
+curl -X POST http://localhost:8080/graphql \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ghp_your_token" \
+  -d '{"query":"mutation { addStar(input:{starrableId:\"...\"}) { clientMutationId }}"}'
 ```
 
 ## License

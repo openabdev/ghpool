@@ -7,6 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Json,
     routing::get,
+    routing::post,
     Router,
 };
 use serde_json::Value;
@@ -17,23 +18,33 @@ struct AppState {
     pool: pool::PatPool,
     cache: cache::Cache,
     config: config::Config,
+    token_users: moka::future::Cache<String, String>,
 }
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("ghpool=info".parse().unwrap()))
+        .with_timer(tracing_subscriber::fmt::time::LocalTime::new(
+            time::format_description::parse("[year]-[month]-[day]T[hour]:[minute]:[second]").unwrap(),
+        ))
         .init();
 
-    let config = config::Config::load();
+    let config = config::Config::load().await;
     let pool = pool::PatPool::new(&config.identities);
     let cache = cache::Cache::new(&config.cache);
 
-    let state = Arc::new(AppState { pool, cache, config: config.clone() });
+    let state = Arc::new(AppState {
+        pool,
+        cache,
+        config: config.clone(),
+        token_users: moka::future::Cache::builder().max_capacity(100).build(),
+    });
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
+        .route("/graphql", post(graphql_proxy))
         .route("/{*path}", get(proxy))
         .with_state(state);
 
@@ -74,7 +85,7 @@ async fn proxy(
 
     // Check cache
     if let Some(cached) = state.cache.get(&cache_key).await {
-        tracing::debug!("cache hit: {}", api_path);
+        tracing::info!("200 OK {} [cache HIT]", api_path);
         return Ok(Json(cached));
     }
 
@@ -131,6 +142,7 @@ async fn proxy(
     let route_kind = cache::classify_route(&api_path);
     state.cache.insert(&cache_key, &body, route_kind).await;
 
+    tracing::info!("200 OK {} [via {}]", api_path, identity.id);
     Ok(Json(body))
 }
 
@@ -142,4 +154,106 @@ fn is_allowed_path(path: &str, allowed_owners: &[String]) -> bool {
     }
     // Non-repo paths (e.g. /rate_limit) are allowed
     true
+}
+
+async fn graphql_proxy(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, StatusCode> {
+    let body_value: Value = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let query_str = body_value.get("query").and_then(|q| q.as_str()).unwrap_or("");
+    let is_mutation = query_str.trim_start().starts_with("mutation");
+
+    // For queries: check cache
+    let cache_key = format!("graphql:{}", cache::build_graphql_key(&body));
+    if !is_mutation {
+        if let Some(cached) = state.cache.get(&cache_key).await {
+            tracing::info!("200 OK /graphql [cache HIT]");
+            return Ok(Json(cached));
+        }
+    }
+
+    // Mutations: passthrough client's own auth. Queries: use pooled PAT.
+    let (auth_header, identity_id) = if is_mutation {
+        let client_auth = headers.get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                tracing::warn!("mutation rejected: no Authorization header from client");
+                StatusCode::UNAUTHORIZED
+            })?
+            .to_string();
+        let id = resolve_token_user(&state, &client_auth).await;
+        (client_auth, id)
+    } else {
+        let identity = state.pool.select().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        (format!("Bearer {}", identity.token), identity.id.clone())
+    };
+
+    let client = reqwest::Client::new();
+    let resp = client.post("https://api.github.com/graphql")
+        .header("Authorization", &auth_header)
+        .header("User-Agent", "ghpool/0.1.0")
+        .header("Content-Type", "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::error!("graphql request failed: {}", e);
+            StatusCode::BAD_GATEWAY
+        })?;
+
+    if !is_mutation {
+        let rate_remaining = resp.headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u32>().ok());
+        let rate_reset = resp.headers()
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        state.pool.update_rate(&identity_id, rate_remaining, rate_reset);
+    }
+
+    let status = resp.status();
+    let resp_body: Value = resp.json().await.map_err(|e| {
+        tracing::error!("failed to parse graphql response: {}", e);
+        StatusCode::BAD_GATEWAY
+    })?;
+
+    if !status.is_success() {
+        tracing::warn!("graphql returned {}", status);
+        return Err(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
+    }
+
+    if !is_mutation {
+        state.cache.insert(&cache_key, &resp_body, cache::RouteKind::Other).await;
+    }
+
+    tracing::info!("200 OK /graphql [via {}]{}", identity_id, if is_mutation { " (mutation)" } else { "" });
+    Ok(Json(resp_body))
+}
+
+async fn resolve_token_user(state: &AppState, auth_header: &str) -> String {
+    let key = auth_header.chars().rev().take(8).collect::<String>();
+    if let Some(user) = state.token_users.get(&key).await {
+        return user;
+    }
+    let client = reqwest::Client::new();
+    let user = match client.get("https://api.github.com/user")
+        .header("Authorization", auth_header)
+        .header("User-Agent", "ghpool/0.1.0")
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            resp.json::<Value>().await.ok()
+                .and_then(|v| v["login"].as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown".to_string())
+        }
+        _ => "unknown".to_string(),
+    };
+    state.token_users.insert(key, user.clone()).await;
+    user
 }
