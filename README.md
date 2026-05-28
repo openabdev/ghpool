@@ -249,14 +249,40 @@ If a mutation request has no `Authorization` header, ghpool returns `401`.
 
 ## How clients use it
 
+### ghp CLI (recommended)
+
+`ghp` is a drop-in `gh` shim that routes read commands through ghpool's REST API (pooled + cached) and falls through to the real `gh` for writes.
+
+```sh
+export GHPOOL_URL=http://ghpool.openab.local:8080
+
+# Reads — through ghpool (pooled + cached)
+ghp api repos/org/repo --jq .stargazers_count
+ghp issue list -R org/repo -L 10
+ghp pr list -R org/repo
+ghp pr view 123 -R org/repo
+ghp run list -R org/repo
+
+# Writes — falls through to real gh (direct to GitHub)
+ghp issue create -R org/repo -t "title" -b "body"
+ghp issue comment 123 -R org/repo -b "comment"
+ghp pr create -R org/repo -t "title" -b "body"
+```
+
+To replace `gh` transparently:
+
+```sh
+ln -sf $(which ghp) ~/bin/gh
+export PATH=~/bin:$PATH
+```
+
 ### gh CLI
 
 ```sh
 export GITHUB_API_URL=http://localhost:8080
-export GITHUB_GRAPHQL_URL=http://localhost:8080/graphql
 ```
 
-All `gh` commands work transparently — reads are pooled+cached, writes use your own auth.
+REST calls (`gh api repos/...`) route through ghpool. Note: `gh` CLI's built-in commands (`gh issue list`, `gh pr list`) use GraphQL internally and bypass `GITHUB_API_URL` — use `ghp` for full coverage.
 
 ### Coding agents
 
