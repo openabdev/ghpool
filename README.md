@@ -210,30 +210,30 @@ If a mutation request has no `Authorization` header, ghpool returns `401`.
 
 ```
   ┌────────────────────────────────────────────────────────────────┐
-  │                    POST /graphql                                │
+  │                    POST /graphql                               │
   │                                                                │
   │  Parse request body → extract "query" field                    │
   │                                                                │
   │  ┌─────────────────────┐       ┌────────────────────────────┐  │
   │  │ starts with "query" │       │ starts with "mutation"     │  │
   │  └──────────┬──────────┘       └──────────────┬─────────────┘  │
-  │             │                                  │                │
-  │             ▼                                  ▼                │
+  │             │                                  │               │
+  │             ▼                                  ▼               │
   │  ┌─────────────────────┐       ┌────────────────────────────┐  │
   │  │ Check cache         │       │ Require client             │  │
   │  │  HIT → return       │       │ Authorization header       │  │
   │  │  MISS ↓             │       │  missing → 401             │  │
   │  └──────────┬──────────┘       └──────────────┬─────────────┘  │
-  │             │                                  │                │
-  │             ▼                                  ▼                │
+  │             │                                  │               │
+  │             ▼                                  ▼               │
   │  ┌─────────────────────┐       ┌────────────────────────────┐  │
   │  │ Select pooled PAT   │       │ Passthrough client's token │  │
   │  │ (highest budget)    │       │ (identity preserved)       │  │
   │  └──────────┬──────────┘       └──────────────┬─────────────┘  │
-  │             │                                  │                │
-  │             ▼                                  ▼                │
+  │             │                                  │               │
+  │             ▼                                  ▼               │
   │  ┌─────────────────────┐       ┌────────────────────────────┐  │
-  │  │ Forward to GitHub   │       │ Forward to GitHub           │  │
+  │  │ Forward to GitHub   │       │ Forward to GitHub          │  │
   │  │ Cache response      │       │ No caching                 │  │
   │  │ Update rate limits  │       │ Log resolved username      │  │
   │  └─────────────────────┘       └────────────────────────────┘  │
