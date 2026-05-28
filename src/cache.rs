@@ -107,6 +107,13 @@ pub fn build_key(path: &str, query: &HashMap<String, String>) -> String {
     if qs.is_empty() { path.to_string() } else { format!("{}?{}", path, qs) }
 }
 
+pub fn build_graphql_key(body: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
 pub fn classify_route(path: &str) -> RouteKind {
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() < 4 { return RouteKind::Other; }

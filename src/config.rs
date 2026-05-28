@@ -1,18 +1,15 @@
 use serde::Deserialize;
 use std::fs;
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone)]
 pub struct Config {
-    #[serde(default = "default_port")]
     pub port: u16,
     pub identities: Vec<IdentityConfig>,
-    #[serde(default)]
     pub allowed_owners: Vec<String>,
-    #[serde(default)]
     pub cache: CacheConfig,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone)]
 pub struct IdentityConfig {
     pub id: String,
     pub token: String,
@@ -58,19 +55,39 @@ fn default_commit_ttl() -> u64 { 120 }
 fn default_repo_ttl() -> u64 { 300 }
 fn default_ttl() -> u64 { 60 }
 
+// Raw TOML structures (before secret resolution)
+#[derive(Deserialize)]
+struct RawConfig {
+    #[serde(default = "default_port")]
+    port: u16,
+    #[serde(default)]
+    identities: Vec<RawIdentity>,
+    #[serde(default)]
+    allowed_owners: Vec<String>,
+    #[serde(default)]
+    cache: CacheConfig,
+}
+
+#[derive(Deserialize)]
+struct RawIdentity {
+    id: String,
+    token: String, // may be a secret reference
+}
+
 impl Config {
-    pub fn load() -> Self {
+    pub async fn load() -> Self {
         let path = std::env::var("GHPOOL_CONFIG")
-            .unwrap_or_else(|_| "config.yaml".to_string());
+            .unwrap_or_else(|_| "config.toml".to_string());
 
         if let Ok(content) = fs::read_to_string(&path) {
-            let mut config: Config = serde_yaml::from_str(&content)
+            let raw: RawConfig = toml::from_str(&content)
                 .expect("failed to parse config file");
+            let mut config = Self::from_raw(raw).await;
             config.apply_env_overrides();
             return config;
         }
 
-        // Fallback: load from environment variables only
+        // Fallback: env vars only
         let identities = Self::identities_from_env();
         let allowed_owners = std::env::var("GHPOOL_ALLOWED_OWNERS")
             .unwrap_or_default()
@@ -83,11 +100,20 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(default_port());
 
+        Config { port, identities, allowed_owners, cache: CacheConfig::default() }
+    }
+
+    async fn from_raw(raw: RawConfig) -> Self {
+        let mut identities = Vec::with_capacity(raw.identities.len());
+        for ri in raw.identities {
+            let token = resolve_secret(&ri.token).await;
+            identities.push(IdentityConfig { id: ri.id, token });
+        }
         Config {
-            port,
+            port: raw.port,
             identities,
-            allowed_owners,
-            cache: CacheConfig::default(),
+            allowed_owners: raw.allowed_owners,
+            cache: raw.cache,
         }
     }
 
@@ -100,7 +126,6 @@ impl Config {
         }
     }
 
-    /// Parse GHPOOL_PAT_<ID>=<token> env vars
     fn identities_from_env() -> Vec<IdentityConfig> {
         std::env::vars()
             .filter(|(k, _)| k.starts_with("GHPOOL_PAT_"))
@@ -110,4 +135,59 @@ impl Config {
             })
             .collect()
     }
+}
+
+/// Resolve a secret reference string.
+/// Formats:
+///   aws:secretsmanager:<secret-name>:<json-key>
+///   k8s:<namespace>/<secret-name>:<key>
+///   env:<VAR_NAME>
+///   (anything else) — used as literal value
+async fn resolve_secret(value: &str) -> String {
+    if let Some(rest) = value.strip_prefix("env:") {
+        return std::env::var(rest)
+            .unwrap_or_else(|_| panic!("env var {} not set", rest));
+    }
+    if let Some(rest) = value.strip_prefix("aws:secretsmanager:") {
+        return resolve_aws_secret(rest).await;
+    }
+    if let Some(rest) = value.strip_prefix("k8s:") {
+        return resolve_k8s_secret(rest);
+    }
+    value.to_string()
+}
+
+async fn resolve_aws_secret(spec: &str) -> String {
+    // spec = "secret-name:json-key"
+    let (secret_name, json_key) = spec.split_once(':')
+        .expect("aws secret ref must be aws:secretsmanager:<name>:<key>");
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let client = aws_sdk_secretsmanager::Client::new(&config);
+    let resp = client.get_secret_value()
+        .secret_id(secret_name)
+        .send()
+        .await
+        .expect("failed to fetch secret from AWS Secrets Manager");
+    let secret_string = resp.secret_string()
+        .expect("secret has no string value");
+    let parsed: serde_json::Value = serde_json::from_str(secret_string)
+        .expect("secret value is not valid JSON");
+    parsed[json_key].as_str()
+        .unwrap_or_else(|| panic!("key '{}' not found in secret '{}'", json_key, secret_name))
+        .to_string()
+}
+
+fn resolve_k8s_secret(spec: &str) -> String {
+    // spec = "namespace/secret-name:key"
+    // Reads from /var/run/secrets/kubernetes.io/serviceaccount/.. mounted path
+    // or the standard projected volume path: /etc/secrets/<secret-name>/<key>
+    let (path_part, key) = spec.split_once(':')
+        .expect("k8s secret ref must be k8s:<namespace>/<secret-name>:<key>");
+    let (_, secret_name) = path_part.split_once('/')
+        .expect("k8s secret ref must include namespace/secret-name");
+    let file_path = format!("/etc/secrets/{}/{}", secret_name, key);
+    fs::read_to_string(&file_path)
+        .unwrap_or_else(|_| panic!("cannot read k8s secret at {}", file_path))
+        .trim()
+        .to_string()
 }
