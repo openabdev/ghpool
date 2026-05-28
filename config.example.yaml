@@ -1,0 +1,20 @@
+port: 8080
+
+identities:
+  - id: pat_alice
+    token: ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  - id: pat_bob
+    token: ghp_yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+
+allowed_owners:
+  - openclaw
+  - openabdev
+
+cache:
+  max_entries: 10000
+  pr_view_ttl_secs: 30
+  issue_list_ttl_secs: 30
+  run_list_ttl_secs: 15
+  commit_list_ttl_secs: 120
+  repo_view_ttl_secs: 300
+  default_ttl_secs: 60

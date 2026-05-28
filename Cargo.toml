@@ -1,0 +1,18 @@
+[package]
+name = "ghpool"
+version = "0.1.0"
+edition = "2021"
+description = "Internal GitHub API proxy with PAT pooling and caching"
+license = "MIT"
+
+[dependencies]
+axum = "0.8.1"
+tokio = { version = "1.43", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1.0"
+moka = { version = "0.12", features = ["future"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
