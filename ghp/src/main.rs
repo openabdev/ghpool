@@ -183,6 +183,14 @@ fn jq_extract(val: &serde_json::Value, expr: &str) -> String {
 }
 
 fn find_real_gh() -> String {
+    // Look for gh-real first (when ghp replaces /usr/bin/gh)
+    for dir in env::var("PATH").unwrap_or_default().split(':') {
+        let candidate = format!("{}/gh-real", dir);
+        if std::path::Path::new(&candidate).exists() {
+            return candidate;
+        }
+    }
+    // Fallback: find gh that isn't ourselves
     let self_path = env::current_exe().ok();
     for dir in env::var("PATH").unwrap_or_default().split(':') {
         let candidate = format!("{}/gh", dir);
