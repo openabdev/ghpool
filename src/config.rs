@@ -34,9 +34,6 @@ pub struct CacheConfig {
     /// TTL for raw (non-JSON, e.g. diff/patch) responses.
     #[serde(default = "default_raw_ttl")]
     pub raw_ttl_secs: u64,
-    /// Max entry count for the raw response cache.
-    #[serde(default = "default_raw_max_entries")]
-    pub raw_max_entries: u64,
     /// Max total bytes held by the raw response cache (weigher-enforced).
     #[serde(default = "default_raw_max_bytes")]
     pub raw_max_bytes: u64,
@@ -53,7 +50,6 @@ impl Default for CacheConfig {
             repo_view_ttl_secs: default_repo_ttl(),
             default_ttl_secs: default_ttl(),
             raw_ttl_secs: default_raw_ttl(),
-            raw_max_entries: default_raw_max_entries(),
             raw_max_bytes: default_raw_max_bytes(),
         }
     }
@@ -64,7 +60,6 @@ fn default_max_entries() -> u64 { 10000 }
 fn default_pr_ttl() -> u64 { 30 }
 fn default_run_ttl() -> u64 { 15 }
 fn default_raw_ttl() -> u64 { 30 }
-fn default_raw_max_entries() -> u64 { 5000 }
 fn default_raw_max_bytes() -> u64 { 256 * 1024 * 1024 } // 256 MiB
 fn default_commit_ttl() -> u64 { 120 }
 fn default_repo_ttl() -> u64 { 300 }

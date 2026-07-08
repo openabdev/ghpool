@@ -43,9 +43,8 @@ impl Cache {
             .build();
         // Raw (diff/patch) cache: bounded primarily by total bytes via a
         // weigher, since diff bodies can be multi-MB (unlike JSON metadata
-        // responses). `raw_max_entries` is retained in config for operators
-        // who want to reason about entry count, but moka's max_capacity here
-        // tracks weighted bytes, not entry count.
+        // responses). moka's max_capacity here tracks weighted bytes, not
+        // entry count.
         let raw_store = MokaCache::builder()
             .max_capacity(config.raw_max_bytes)
             .weigher(move |key: &String, value: &String| -> u32 {
@@ -55,7 +54,6 @@ impl Cache {
             .build();
         tracing::debug!(
             raw_max_bytes = config.raw_max_bytes,
-            raw_max_entries_hint = config.raw_max_entries,
             raw_ttl_secs = config.raw_ttl_secs,
             "raw cache configured"
         );

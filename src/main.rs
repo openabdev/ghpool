@@ -105,7 +105,7 @@ async fn proxy(
     // Forward request
     let mut req = state.http.get(&url)
         .header("Authorization", format!("Bearer {}", identity.token))
-        .header("User-Agent", "ghpool/0.1.0")
+        .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
         .header("Accept", "application/vnd.github+json");
 
     if let Some(version) = headers.get("x-github-api-version") {
@@ -187,7 +187,7 @@ async fn proxy_raw(
     let result = state.cache.get_or_insert_raw(&cache_key, async move {
         let resp = state_for_fetch.http.get(&url)
             .header("Authorization", format!("Bearer {}", token))
-            .header("User-Agent", "ghpool/0.1.0")
+            .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
             .header("Accept", &accept)
             .send()
             .await
@@ -281,7 +281,7 @@ async fn graphql_proxy(
 
     let resp = state.http.post("https://api.github.com/graphql")
         .header("Authorization", &auth_header)
-        .header("User-Agent", "ghpool/0.1.0")
+        .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
         .header("Content-Type", "application/json")
         .body(body.to_vec())
         .send()
@@ -329,7 +329,7 @@ async fn resolve_token_user(state: &AppState, auth_header: &str) -> String {
     }
     let user = match state.http.get("https://api.github.com/user")
         .header("Authorization", auth_header)
-        .header("User-Agent", "ghpool/0.1.0")
+        .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
         .send()
         .await
     {
