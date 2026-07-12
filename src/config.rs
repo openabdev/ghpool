@@ -7,6 +7,7 @@ pub struct Config {
     pub identities: Vec<IdentityConfig>,
     pub allowed_owners: Vec<String>,
     pub cache: CacheConfig,
+    pub mcp: McpConfig,
 }
 
 #[derive(Clone)]
@@ -47,6 +48,41 @@ impl Default for CacheConfig {
     }
 }
 
+/// MCP reverse proxy configuration (Phase 1: read-only).
+/// When enabled, ghpool proxies MCP Streamable HTTP traffic on /mcp to the
+/// GitHub-hosted MCP server, injecting a pooled credential upstream so agents
+/// never hold a GitHub token.
+#[derive(Clone, Deserialize)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Upstream MCP endpoint. Defaults to GitHub's hosted read-only variant.
+    #[serde(default = "default_mcp_upstream")]
+    pub upstream: String,
+    /// Optional toolset restriction, injected as X-MCP-Toolsets header.
+    #[serde(default)]
+    pub toolsets: Vec<String>,
+    /// Idle TTL for session → identity pinning.
+    #[serde(default = "default_mcp_session_ttl")]
+    pub session_ttl_secs: u64,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            upstream: default_mcp_upstream(),
+            toolsets: Vec::new(),
+            session_ttl_secs: default_mcp_session_ttl(),
+        }
+    }
+}
+
+fn default_mcp_upstream() -> String {
+    "https://api.githubcopilot.com/mcp/readonly".to_string()
+}
+fn default_mcp_session_ttl() -> u64 { 3600 }
+
 fn default_port() -> u16 { 8080 }
 fn default_max_entries() -> u64 { 10000 }
 fn default_pr_ttl() -> u64 { 30 }
@@ -66,6 +102,8 @@ struct RawConfig {
     allowed_owners: Vec<String>,
     #[serde(default)]
     cache: CacheConfig,
+    #[serde(default)]
+    mcp: McpConfig,
 }
 
 #[derive(Deserialize)]
@@ -100,7 +138,7 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(default_port());
 
-        Config { port, identities, allowed_owners, cache: CacheConfig::default() }
+        Config { port, identities, allowed_owners, cache: CacheConfig::default(), mcp: McpConfig::default() }
     }
 
     async fn from_raw(raw: RawConfig) -> Self {
@@ -114,6 +152,7 @@ impl Config {
             identities,
             allowed_owners: raw.allowed_owners,
             cache: raw.cache,
+            mcp: raw.mcp,
         }
     }
 
@@ -123,6 +162,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("GHPOOL_ALLOWED_OWNERS") {
             self.allowed_owners = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        }
+        if let Ok(v) = std::env::var("GHPOOL_MCP_ENABLED") {
+            self.mcp.enabled = matches!(v.to_lowercase().as_str(), "1" | "true" | "yes");
         }
     }
 
