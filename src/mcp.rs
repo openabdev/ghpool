@@ -14,6 +14,11 @@
 //!   optional `X-MCP-Toolsets` are injected.
 //! - Audit log: JSON-RPC request frames are parsed best-effort to log
 //!   `method` (and tool name for `tools/call`) per request.
+//!
+//! NOTE: `allowed_owners` is NOT enforced on /mcp in Phase 1 — doing so
+//! requires tool-argument inspection. Access is bounded by the pooled token's
+//! own permissions and the read-only upstream. Per-agent policy is tracked in
+//! https://github.com/openabdev/ghpool/issues/17.
 
 use axum::{
     body::{Body, Bytes},
@@ -24,6 +29,14 @@ use axum::{
 use std::sync::Arc;
 
 use crate::{pool, AppState};
+
+/// Max accepted request body (JSON-RPC frames are typically <10 KB).
+pub const MAX_BODY_BYTES: usize = 1_048_576;
+
+/// POST covers initialize/tools calls — bounded responses, generous ceiling.
+const POST_TIMEOUT_SECS: u64 = 120;
+/// DELETE is a small control-plane call.
+const DELETE_TIMEOUT_SECS: u64 = 30;
 
 /// Response headers propagated back to the MCP client.
 const RESP_HEADERS: &[&str] = &["content-type", "mcp-session-id", "mcp-protocol-version"];
@@ -42,13 +55,27 @@ pub async fn mcp_proxy(
     method: Method,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, StatusCode> {
+) -> Response {
     let session_id = headers
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    let identity = pick_identity(&state, session_id.as_deref()).await?;
+    // Session termination without a session identifier is semantically invalid
+    if method == Method::DELETE && session_id.is_none() {
+        return rpc_error(StatusCode::BAD_REQUEST, "Mcp-Session-Id header required");
+    }
+
+    let identity = match pick_identity(&state, session_id.as_deref()).await {
+        Ok(i) => i,
+        Err(StatusCode::NOT_FOUND) => {
+            // Per MCP Streamable HTTP spec: unknown/expired sessions get 404,
+            // prompting the client to re-initialize. Never rotate identities
+            // mid-session.
+            return rpc_error(StatusCode::NOT_FOUND, "session not found or expired");
+        }
+        Err(code) => return rpc_error(code, "no upstream identity available"),
+    };
 
     // Audit log (best-effort JSON-RPC frame parse)
     if method == Method::POST {
@@ -67,21 +94,35 @@ pub async fn mcp_proxy(
     }
 
     let upstream = &state.config.mcp.upstream;
+    // Timeouts are method-specific: POST responses (including SSE tool-call
+    // results) complete within a bounded window, but GET is the stream
+    // resumption channel and may legitimately stay open indefinitely — a
+    // total timeout there would sever healthy streams.
     let req = match method {
-        Method::POST => state.http.post(upstream).body(body.to_vec()),
+        Method::POST => state
+            .http
+            .post(upstream)
+            .body(reqwest::Body::from(body))
+            .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS)),
         Method::GET => state.http.get(upstream),
-        Method::DELETE => state.http.delete(upstream),
-        _ => return Err(StatusCode::METHOD_NOT_ALLOWED),
+        Method::DELETE => state
+            .http
+            .delete(upstream)
+            .timeout(std::time::Duration::from_secs(DELETE_TIMEOUT_SECS)),
+        _ => return rpc_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
     };
 
-    let resp = req
+    let resp = match req
         .headers(build_upstream_headers(&headers, &identity.token, &state.config.mcp.toolsets))
         .send()
         .await
-        .map_err(|e| {
+    {
+        Ok(r) => r,
+        Err(e) => {
             tracing::error!("mcp upstream request failed: {}", e);
-            StatusCode::BAD_GATEWAY
-        })?;
+            return rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed");
+        }
+    };
 
     // Best-effort rate budget accounting, if upstream exposes it
     let rate_remaining = resp.headers()
@@ -93,6 +134,17 @@ pub async fn mcp_proxy(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     state.pool.update_rate(&identity.id, rate_remaining, rate_reset);
+
+    // Upstream throttled this identity: zero its budget so the pool avoids it
+    // for new sessions until the reported (or a short default) reset.
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        state.pool.update_rate(&identity.id, Some(0), Some(rate_reset.unwrap_or(now + 60)));
+        tracing::warn!("MCP upstream 429 for identity {} — budget zeroed", identity.id);
+    }
 
     // Pin new sessions: upstream returns Mcp-Session-Id on initialize
     if let Some(sid) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()) {
@@ -123,11 +175,16 @@ pub async fn mcp_proxy(
 
     builder
         .body(Body::from_stream(resp.bytes_stream()))
-        .map_err(|_| StatusCode::BAD_GATEWAY)
+        .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"))
 }
 
-/// Resolve the identity for this request: pinned identity if the session is
-/// known, otherwise the highest-budget identity from the pool (new session).
+/// Resolve the identity for this request per MCP Streamable HTTP session
+/// semantics:
+/// - No session ID (i.e. `initialize`): select the highest-budget identity.
+/// - Known session ID: return the pinned identity — never rotate mid-session.
+/// - Unknown/expired session ID (including TTL/capacity eviction of the pin,
+///   or the pinned identity leaving the pool): 404, so the client
+///   re-initializes.
 async fn pick_identity(
     state: &AppState,
     session_id: Option<&str>,
@@ -137,9 +194,27 @@ async fn pick_identity(
             if let Some(ident) = state.pool.get(&id) {
                 return Ok(ident);
             }
+            // Pinned identity no longer in the pool — treat as terminated
+            state.mcp_sessions.invalidate(sid).await;
         }
+        return Err(StatusCode::NOT_FOUND);
     }
     state.pool.select().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+}
+
+/// Minimal JSON-RPC error body for proxy-level failures, so MCP clients that
+/// only speak JSON-RPC degrade gracefully.
+fn rpc_error(status: StatusCode, message: &str) -> Response {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "error": { "code": -32000, "message": message }
+    });
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static error response")
 }
 
 /// Build the upstream header set from scratch: the client's Authorization (and
@@ -185,12 +260,6 @@ fn frame_summary(body: &[u8]) -> Option<(String, Option<String>)> {
         None
     };
     Some((method, tool))
-}
-
-/// Whether this frame is an MCP `initialize` request (start of a new session).
-#[allow(dead_code)]
-fn is_initialize(body: &[u8]) -> bool {
-    matches!(frame_summary(body), Some((m, _)) if m == "initialize")
 }
 
 fn session_suffix(session_id: Option<&str>) -> String {
@@ -257,8 +326,6 @@ mod tests {
         let (method, tool) = frame_summary(body).unwrap();
         assert_eq!(method, "initialize");
         assert!(tool.is_none());
-        assert!(is_initialize(body));
-        assert!(!is_initialize(br#"{"method":"tools/list"}"#));
     }
 
     #[test]
@@ -305,10 +372,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unknown_session_falls_back_to_pool() {
+    async fn test_unknown_session_returns_404() {
         let state = test_state(&["alice"]);
-        let ident = pick_identity(&state, Some("never-seen")).await.unwrap();
-        assert_eq!(ident.id, "alice");
+        match pick_identity(&state, Some("never-seen")).await {
+            Err(code) => assert_eq!(code, StatusCode::NOT_FOUND),
+            Ok(_) => panic!("unknown session must not resolve an identity"),
+        }
     }
 
     #[tokio::test]
@@ -328,12 +397,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stale_pin_falls_back_to_pool() {
-        // Session pinned to an identity that no longer exists in the pool
+    async fn test_stale_pin_returns_404_and_unpins() {
+        // Session pinned to an identity that no longer exists in the pool:
+        // treated as terminated (404), pin removed — never identity rotation.
         let state = test_state(&["alice"]);
         state.mcp_sessions.insert("sess-x".to_string(), "gone".to_string()).await;
-        let ident = pick_identity(&state, Some("sess-x")).await.unwrap();
-        assert_eq!(ident.id, "alice");
+        match pick_identity(&state, Some("sess-x")).await {
+            Err(code) => assert_eq!(code, StatusCode::NOT_FOUND),
+            Ok(_) => panic!("stale pin must not resolve an identity"),
+        }
+        assert!(state.mcp_sessions.get("sess-x").await.is_none());
     }
 
     // ---- Integration tests: real handler against an in-process mock upstream ----
@@ -537,6 +610,43 @@ mod tests {
         // DELETE was forwarded upstream and the local pin was dropped
         assert_eq!(captured.lock().unwrap()[0].method, "DELETE");
         assert!(state.mcp_sessions.get("dead-sess").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_unknown_session_returns_404_jsonrpc_error() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_with(&["alice"], &url, &[]);
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[("mcp-session-id", "ghost-session")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Error body is a JSON-RPC error object, not a bare status
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert!(v["error"]["message"].is_string());
+
+        // Upstream must never see a request for an unknown session
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_delete_without_session_returns_400() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_with(&["alice"], &url, &[]);
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/mcp")
+            .body(Body::empty())
+            .unwrap();
+        let resp = mcp_app(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(captured.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
