@@ -204,8 +204,14 @@ fn session_suffix(session_id: Option<&str>) -> String {
 mod tests {
     use super::*;
     use crate::{cache, config};
+    use axum::http::Request;
+    use tower::ServiceExt;
 
     fn test_state(identity_ids: &[&str]) -> Arc<AppState> {
+        test_state_with(identity_ids, "http://unused.invalid", &[])
+    }
+
+    fn test_state_with(identity_ids: &[&str], upstream: &str, toolsets: &[&str]) -> Arc<AppState> {
         let identities: Vec<config::IdentityConfig> = identity_ids
             .iter()
             .map(|id| config::IdentityConfig {
@@ -224,7 +230,12 @@ mod tests {
                 identities,
                 allowed_owners: vec!["openabdev".to_string()],
                 cache: cache_config,
-                mcp: config::McpConfig::default(),
+                mcp: config::McpConfig {
+                    enabled: true,
+                    upstream: upstream.to_string(),
+                    toolsets: toolsets.iter().map(|s| s.to_string()).collect(),
+                    session_ttl_secs: 3600,
+                },
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
             http: reqwest::Client::new(),
@@ -323,5 +334,222 @@ mod tests {
         state.mcp_sessions.insert("sess-x".to_string(), "gone".to_string()).await;
         let ident = pick_identity(&state, Some("sess-x")).await.unwrap();
         assert_eq!(ident.id, "alice");
+    }
+
+    // ---- Integration tests: real handler against an in-process mock upstream ----
+
+    #[derive(Clone)]
+    struct Captured {
+        method: String,
+        auth: Option<String>,
+        toolsets: Option<String>,
+        session: Option<String>,
+        body: String,
+    }
+
+    type CapturedLog = Arc<std::sync::Mutex<Vec<Captured>>>;
+
+    const MOCK_SSE_BODY: &str =
+        "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{}}\n\n";
+
+    /// Plays the GitHub-hosted MCP server: records every request it receives,
+    /// returns an SSE response with an Mcp-Session-Id for `initialize` frames,
+    /// plain JSON otherwise, and 500 for frames containing "fail_500".
+    async fn mock_upstream_handler(
+        State(captured): State<CapturedLog>,
+        method: Method,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Response {
+        let get = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).map(str::to_string);
+        let body_str = String::from_utf8_lossy(&body).to_string();
+        captured.lock().unwrap().push(Captured {
+            method: method.to_string(),
+            auth: get("authorization"),
+            toolsets: get("x-mcp-toolsets"),
+            session: get("mcp-session-id"),
+            body: body_str.clone(),
+        });
+        if body_str.contains("fail_500") {
+            return Response::builder()
+                .status(500)
+                .body(Body::from("upstream error"))
+                .unwrap();
+        }
+        if body_str.contains("\"initialize\"") {
+            return Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .header("mcp-session-id", "mock-sess-1")
+                .body(Body::from(MOCK_SSE_BODY))
+                .unwrap();
+        }
+        Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#))
+            .unwrap()
+    }
+
+    async fn spawn_mock_upstream() -> (String, CapturedLog) {
+        let captured: CapturedLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route("/", axum::routing::any(mock_upstream_handler))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{}", addr), captured)
+    }
+
+    fn mcp_app(state: Arc<AppState>) -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/mcp",
+                axum::routing::post(mcp_proxy).get(mcp_proxy).delete(mcp_proxy),
+            )
+            .with_state(state)
+    }
+
+    fn post_frame(frame: &str, extra_headers: &[(&str, &str)]) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json");
+        for (k, v) in extra_headers {
+            builder = builder.header(*k, *v);
+        }
+        builder.body(Body::from(frame.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_proxy_strips_client_auth_and_injects_pool_token() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_with(&["alice"], &url, &[]);
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[("authorization", "Bearer client-secret")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].auth.as_deref(), Some("Bearer token-alice"));
+        assert!(reqs[0].toolsets.is_none());
+        assert!(reqs[0].body.contains("tools/list"));
+    }
+
+    #[tokio::test]
+    async fn test_proxy_forwards_configured_toolsets() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_with(&["alice"], &url, &["issues", "pull_requests"]);
+        let resp = mcp_app(state)
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs[0].toolsets.as_deref(), Some("issues,pull_requests"));
+    }
+
+    #[tokio::test]
+    async fn test_proxy_sse_passthrough_and_session_capture() {
+        let (url, _captured) = spawn_mock_upstream().await;
+        let state = test_state_with(&["alice"], &url, &[]);
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#, &[]))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+        assert_eq!(resp.headers().get("mcp-session-id").unwrap(), "mock-sess-1");
+
+        // SSE body streamed byte-identical
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], MOCK_SSE_BODY.as_bytes());
+
+        // Session pinned to the identity that served initialize
+        assert_eq!(
+            state.mcp_sessions.get("mock-sess-1").await.as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_session_pinned_across_requests() {
+        let (url, captured) = spawn_mock_upstream().await;
+        // Two identities: without pinning, the pool's least-used tie-break
+        // would flip to the other identity on the second request.
+        let state = test_state_with(&["alice", "bob"], &url, &[]);
+        let app = mcp_app(state);
+
+        let resp = app
+            .clone()
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = app
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[("mcp-session-id", "mock-sess-1")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        // Same token on both requests proves the pin overrode pool selection
+        assert_eq!(reqs[0].auth, reqs[1].auth);
+        assert_eq!(reqs[1].session.as_deref(), Some("mock-sess-1"));
+    }
+
+    #[tokio::test]
+    async fn test_proxy_delete_unpins_session() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_with(&["alice"], &url, &[]);
+        state
+            .mcp_sessions
+            .insert("dead-sess".to_string(), "alice".to_string())
+            .await;
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/mcp")
+            .header("mcp-session-id", "dead-sess")
+            .body(Body::empty())
+            .unwrap();
+        let resp = mcp_app(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // DELETE was forwarded upstream and the local pin was dropped
+        assert_eq!(captured.lock().unwrap()[0].method, "DELETE");
+        assert!(state.mcp_sessions.get("dead-sess").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_upstream_error_propagates() {
+        let (url, _captured) = spawn_mock_upstream().await;
+        let state = test_state_with(&["alice"], &url, &[]);
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fail_500"}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
