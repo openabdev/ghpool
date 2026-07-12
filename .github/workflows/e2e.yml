@@ -1,0 +1,56 @@
+name: E2E
+
+# Runs the MCP proxy e2e suite against GitHub's hosted MCP server.
+# Deliberately NOT triggered on pull_request: the required user token
+# (E2E_GHPOOL_PAT secret) must never be exposed to fork PR workflows.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/e2e-mcp.sh"
+      - ".github/workflows/e2e.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege: read the repo, write only workflow artifacts (the log).
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  e2e-mcp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Require E2E secret (this job only runs on trusted triggers)
+        env:
+          E2E_GHPOOL_PAT: ${{ secrets.E2E_GHPOOL_PAT }}
+        run: |
+          if [ -z "${E2E_GHPOOL_PAT}" ]; then
+            echo "::error::E2E_GHPOOL_PAT secret is not configured. This job runs"
+            echo "::error::only on main/dispatch (no forks), so the secret must be set."
+            echo "::error::Add a user PAT: gh secret set E2E_GHPOOL_PAT"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build
+        run: cargo build
+      - name: e2e — MCP reverse proxy against hosted endpoint
+        env:
+          # Must be a user token (PAT); the Actions installation token is not
+          # accepted by api.githubcopilot.com.
+          GITHUB_TOKEN: ${{ secrets.E2E_GHPOOL_PAT }}
+        run: ./scripts/e2e-mcp.sh
+      - name: Upload ghpool server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ghpool-e2e-log
+          path: ghpool-e2e.log
+          if-no-files-found: ignore
