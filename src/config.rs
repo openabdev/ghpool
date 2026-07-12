@@ -148,7 +148,9 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(default_port());
 
-        Config { port, identities, allowed_owners, cache: CacheConfig::default(), mcp: McpConfig::default() }
+        let mut config = Config { port, identities, allowed_owners, cache: CacheConfig::default(), mcp: McpConfig::default() };
+        config.apply_env_overrides();
+        config
     }
 
     async fn from_raw(raw: RawConfig) -> Self {

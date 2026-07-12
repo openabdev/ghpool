@@ -61,7 +61,10 @@ async fn main() {
         tracing::info!("MCP reverse proxy enabled → {}", config.mcp.upstream);
         app = app.route(
             "/mcp",
-            post(mcp::mcp_proxy).get(mcp::mcp_proxy).delete(mcp::mcp_proxy),
+            post(mcp::mcp_proxy)
+                .get(mcp::mcp_proxy)
+                .delete(mcp::mcp_proxy)
+                .layer(axum::extract::DefaultBodyLimit::max(mcp::MAX_BODY_BYTES)),
         );
     }
 
