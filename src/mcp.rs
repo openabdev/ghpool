@@ -72,6 +72,10 @@ pub async fn mcp_proxy(
             // Per MCP Streamable HTTP spec: unknown/expired sessions get 404,
             // prompting the client to re-initialize. Never rotate identities
             // mid-session.
+            tracing::warn!(
+                "MCP request rejected: unknown or expired session{}",
+                session_suffix(session_id.as_deref())
+            );
             return rpc_error(StatusCode::NOT_FOUND, "session not found or expired");
         }
         Err(code) => return rpc_error(code, "no upstream identity available"),
@@ -112,11 +116,17 @@ pub async fn mcp_proxy(
         _ => return rpc_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
     };
 
-    let resp = match req
-        .headers(build_upstream_headers(&headers, &identity.token, &state.config.mcp.toolsets))
-        .send()
-        .await
-    {
+    let Some(upstream_headers) =
+        build_upstream_headers(&headers, &identity.token, &state.config.mcp.toolsets)
+    else {
+        tracing::error!(
+            "identity {} has a token that is not a valid header value — check secret source",
+            identity.id
+        );
+        return rpc_error(StatusCode::BAD_GATEWAY, "upstream credential misconfigured");
+    };
+
+    let resp = match req.headers(upstream_headers).send().await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("mcp upstream request failed: {}", e);
@@ -219,15 +229,14 @@ fn rpc_error(status: StatusCode, message: &str) -> Response {
 
 /// Build the upstream header set from scratch: the client's Authorization (and
 /// anything else unexpected) is never forwarded; the pooled token is injected.
-fn build_upstream_headers(client: &HeaderMap, token: &str, toolsets: &[String]) -> HeaderMap {
+/// Returns None if the configured token is not a valid header value (e.g.
+/// contains a stray newline) — callers must not panic on misconfiguration.
+fn build_upstream_headers(client: &HeaderMap, token: &str, toolsets: &[String]) -> Option<HeaderMap> {
     let mut h = HeaderMap::new();
-    h.insert(
-        "authorization",
-        format!("Bearer {}", token).parse().expect("valid bearer header"),
-    );
+    h.insert("authorization", format!("Bearer {}", token).parse().ok()?);
     h.insert(
         "user-agent",
-        concat!("ghpool/", env!("CARGO_PKG_VERSION")).parse().expect("valid ua header"),
+        concat!("ghpool/", env!("CARGO_PKG_VERSION")).parse().expect("static ua header"),
     );
     for name in FWD_HEADERS {
         if let Some(v) = client.get(*name) {
@@ -243,7 +252,7 @@ fn build_upstream_headers(client: &HeaderMap, token: &str, toolsets: &[String]) 
             h.insert("x-mcp-toolsets", v);
         }
     }
-    h
+    Some(h)
 }
 
 /// Best-effort parse of a JSON-RPC request frame.
@@ -342,7 +351,7 @@ mod tests {
         client.insert("mcp-protocol-version", "2025-06-18".parse().unwrap());
         client.insert("x-random-header", "should-not-forward".parse().unwrap());
 
-        let h = build_upstream_headers(&client, "pool-token", &[]);
+        let h = build_upstream_headers(&client, "pool-token", &[]).unwrap();
 
         assert_eq!(h.get("authorization").unwrap(), "Bearer pool-token");
         assert_eq!(h.get("mcp-session-id").unwrap(), "sess-abc");
@@ -357,8 +366,16 @@ mod tests {
     fn test_header_rewrite_injects_toolsets() {
         let client = HeaderMap::new();
         let toolsets = vec!["issues".to_string(), "pull_requests".to_string()];
-        let h = build_upstream_headers(&client, "t", &toolsets);
+        let h = build_upstream_headers(&client, "t", &toolsets).unwrap();
         assert_eq!(h.get("x-mcp-toolsets").unwrap(), "issues,pull_requests");
+    }
+
+    #[test]
+    fn test_header_rewrite_invalid_token_is_error_not_panic() {
+        // e.g. an untrimmed env secret with a trailing newline must not panic
+        let client = HeaderMap::new();
+        assert!(build_upstream_headers(&client, "tok\nen", &[]).is_none());
+        assert!(build_upstream_headers(&client, "token\n", &[]).is_none());
     }
 
     #[tokio::test]
