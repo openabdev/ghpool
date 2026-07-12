@@ -33,3 +33,17 @@ default_ttl_secs = 60
 # leakage and to correctly distinguish paginated/variant requests.
 raw_ttl_secs = 30
 raw_max_bytes = 268435456  # 256 MiB — total byte budget, enforced via weigher
+
+# MCP reverse proxy (Phase 1: read-only) — https://github.com/openabdev/ghpool/issues/15
+# When enabled, ghpool proxies MCP Streamable HTTP traffic on /mcp to GitHub's
+# hosted MCP server, injecting a pooled credential upstream. Agents connect
+# with zero GitHub tokens:
+#   { "url": "http://ghpool:8080/mcp" }
+[mcp]
+enabled = false
+# Upstream MCP endpoint. Default is GitHub's hosted read-only variant.
+# upstream = "https://api.githubcopilot.com/mcp/readonly"
+# Optional toolset restriction (injected as X-MCP-Toolsets header).
+# toolsets = ["issues", "pull_requests", "repos"]
+# Idle TTL for MCP session → identity pinning.
+# session_ttl_secs = 3600

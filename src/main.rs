@@ -1,5 +1,6 @@
 mod cache;
 mod config;
+mod mcp;
 mod pool;
 
 use axum::{
@@ -20,6 +21,8 @@ struct AppState {
     config: config::Config,
     token_users: moka::future::Cache<String, String>,
     http: reqwest::Client,
+    /// MCP session pinning: Mcp-Session-Id → identity id
+    mcp_sessions: moka::future::Cache<String, String>,
 }
 
 #[tokio::main]
@@ -41,15 +44,31 @@ async fn main() {
         config: config.clone(),
         token_users: moka::future::Cache::builder().max_capacity(100).build(),
         http: reqwest::Client::new(),
+        mcp_sessions: moka::future::Cache::builder()
+            .max_capacity(10_000)
+            .time_to_idle(std::time::Duration::from_secs(config.mcp.session_ttl_secs))
+            .build(),
     });
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
         .route("/graphql", post(graphql_proxy))
         .route("/raw/{*path}", get(proxy_raw))
-        .route("/{*path}", get(proxy))
-        .with_state(state);
+        .route("/{*path}", get(proxy));
+
+    if config.mcp.enabled {
+        tracing::info!("MCP reverse proxy enabled → {}", config.mcp.upstream);
+        app = app.route(
+            "/mcp",
+            post(mcp::mcp_proxy)
+                .get(mcp::mcp_proxy)
+                .delete(mcp::mcp_proxy)
+                .layer(axum::extract::DefaultBodyLimit::max(mcp::MAX_BODY_BYTES)),
+        );
+    }
+
+    let app = app.with_state(state);
 
     let addr = format!("0.0.0.0:{}", config.port);
     tracing::info!("ghpool listening on {}", addr);
@@ -367,9 +386,11 @@ mod tests {
                 identities,
                 allowed_owners: allowed_owners.iter().map(|s| s.to_string()).collect(),
                 cache: cache_config,
+                mcp: config::McpConfig::default(),
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
             http: reqwest::Client::new(),
+            mcp_sessions: moka::future::Cache::builder().max_capacity(10).build(),
         })
     }
 

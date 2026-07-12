@@ -63,6 +63,11 @@ impl PatPool {
         Ok(self.identities[best_idx].clone())
     }
 
+    /// Look up an identity by id (used for MCP session pinning).
+    pub fn get(&self, id: &str) -> Option<Identity> {
+        self.identities.iter().find(|i| i.id == id).cloned()
+    }
+
     pub fn update_rate(&self, id: &str, remaining: Option<u32>, reset_at: Option<u64>) {
         let Some(idx) = self.identities.iter().position(|i| i.id == id) else { return };
         let mut states = self.states.lock().unwrap();
