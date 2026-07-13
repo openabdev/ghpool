@@ -124,16 +124,23 @@ struct RawIdentity {
 
 impl Config {
     pub async fn load() -> Self {
-        let path = std::env::var("GHPOOL_CONFIG")
-            .unwrap_or_else(|_| "config.toml".to_string());
-
-        if let Ok(content) = fs::read_to_string(&path) {
-            let raw: RawConfig = toml::from_str(&content)
-                .expect("failed to parse config file");
-            let mut config = Self::from_raw(raw).await;
-            config.apply_env_overrides();
-            return config;
+        if let Some(path) = Self::resolve_config_path() {
+            match fs::read_to_string(&path) {
+                Ok(content) => {
+                    tracing::info!("loading config from {}", path);
+                    let raw: RawConfig = toml::from_str(&content)
+                        .expect("failed to parse config file");
+                    let mut config = Self::from_raw(raw).await;
+                    config.apply_env_overrides();
+                    return config;
+                }
+                Err(e) => {
+                    // Most likely a typo'd GHPOOL_CONFIG — don't fail silently
+                    tracing::warn!("cannot read config at {}: {} — falling back to env-only mode", path, e);
+                }
+            }
         }
+        tracing::info!("no config file found — using environment variables only");
 
         // Fallback: env vars only
         let identities = Self::identities_from_env();
@@ -151,6 +158,31 @@ impl Config {
         let mut config = Config { port, identities, allowed_owners, cache: CacheConfig::default(), mcp: McpConfig::default() };
         config.apply_env_overrides();
         config
+    }
+
+    /// Config file search order:
+    /// 1. GHPOOL_CONFIG env var (explicit always wins; if set but unreadable,
+    ///    a warning is logged and no other file is tried)
+    /// 2. ./config.toml (repo-local dev)
+    /// 3. $XDG_CONFIG_HOME/ghpool/config.toml (default ~/.config/ghpool/)
+    ///
+    /// Returns None when nothing is found → env-only mode.
+    fn resolve_config_path() -> Option<String> {
+        if let Ok(p) = std::env::var("GHPOOL_CONFIG") {
+            return Some(p);
+        }
+        if std::path::Path::new("config.toml").exists() {
+            return Some("config.toml".to_string());
+        }
+        let xdg_base = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("HOME").ok().map(|h| format!("{}/.config", h)))?;
+        let xdg_path = format!("{}/ghpool/config.toml", xdg_base);
+        if std::path::Path::new(&xdg_path).exists() {
+            return Some(xdg_path);
+        }
+        None
     }
 
     async fn from_raw(raw: RawConfig) -> Self {
@@ -244,4 +276,61 @@ fn resolve_k8s_secret(spec: &str) -> String {
         .unwrap_or_else(|_| panic!("cannot read k8s secret at {}", file_path))
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_config_path_chain() {
+        // Single test covering the whole chain to avoid parallel-test races
+        // on process-global state (env vars + cwd; no other test touches
+        // either).
+        let tmp = std::env::temp_dir().join(format!("ghpool-cfg-test-{}", std::process::id()));
+        let ghpool_dir = tmp.join("ghpool");
+        let cwd_dir = tmp.join("cwd");
+        fs::create_dir_all(&ghpool_dir).unwrap();
+        fs::create_dir_all(&cwd_dir).unwrap();
+
+        // Run from an empty cwd so a developer's local ./config.toml doesn't
+        // affect the outcome.
+        let orig_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&cwd_dir).unwrap();
+        std::env::remove_var("GHPOOL_CONFIG");
+        std::env::set_var("XDG_CONFIG_HOME", &tmp);
+
+        assert_eq!(Config::resolve_config_path(), None, "no file anywhere → env-only");
+
+        // ./config.toml in cwd is found
+        fs::write(cwd_dir.join("config.toml"), "port = 1\n").unwrap();
+        assert_eq!(
+            Config::resolve_config_path().as_deref(),
+            Some("config.toml"),
+            "cwd file found"
+        );
+        fs::remove_file(cwd_dir.join("config.toml")).unwrap();
+
+        // XDG file exists → picked up
+        let xdg_file = ghpool_dir.join("config.toml");
+        fs::write(&xdg_file, "port = 1234\n").unwrap();
+        assert_eq!(
+            Config::resolve_config_path().as_deref(),
+            Some(xdg_file.to_str().unwrap()),
+            "XDG path found"
+        );
+
+        // Explicit GHPOOL_CONFIG wins over XDG, even if the path doesn't exist
+        std::env::set_var("GHPOOL_CONFIG", "/nonexistent/override.toml");
+        assert_eq!(
+            Config::resolve_config_path().as_deref(),
+            Some("/nonexistent/override.toml"),
+            "explicit env var always wins"
+        );
+
+        std::env::remove_var("GHPOOL_CONFIG");
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::set_current_dir(orig_cwd).unwrap();
+        fs::remove_dir_all(&tmp).ok();
+    }
 }
