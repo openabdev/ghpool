@@ -1200,7 +1200,6 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
-<<<<<<< HEAD
 
     // ---- 2b-2: write classification + repo allowlists ----
 
@@ -1349,6 +1348,4 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(captured.lock().unwrap().len(), 1);
     }
-=======
->>>>>>> origin/main
 }
