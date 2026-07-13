@@ -10,6 +10,11 @@ name: E2E
 # issue #22). No long-lived PAT required.
 on:
   workflow_dispatch:
+  schedule:
+    # Daily contract-drift canary: the upstream (api.githubcopilot.com) is an
+    # external dependency outside our release control — tool renames or
+    # session-semantics changes should page us via a red run, not a user.
+    - cron: "17 6 * * *"
   push:
     branches: [main]
     paths:
