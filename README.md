@@ -94,7 +94,14 @@ curl http://localhost:8080/stats
 
 ### TOML file
 
-Set `GHPOOL_CONFIG` env var to point to your config file (defaults to `config.toml`).
+Config file search order:
+
+1. `GHPOOL_CONFIG` env var (explicit path — always wins)
+2. `./config.toml` (current directory)
+3. `$XDG_CONFIG_HOME/ghpool/config.toml` (defaults to `~/.config/ghpool/config.toml`)
+4. No file → environment variables only (see below)
+
+The loaded path is logged at startup. For configs in your home directory, prefer secret references (`env:`, `aws:secretsmanager:`, `k8s:`) over plain token literals.
 
 See [config.example.toml](config.example.toml) for all options.
 
