@@ -43,7 +43,25 @@ raw_max_bytes = 268435456  # 256 MiB — total byte budget, enforced via weigher
 enabled = false
 # Upstream MCP endpoint. Default is GitHub's hosted read-only variant.
 # upstream = "https://api.githubcopilot.com/mcp/readonly"
-# Optional toolset restriction (injected as X-MCP-Toolsets header).
+# Optional toolset restriction (X-MCP-Toolsets header). Only used when no
+# [[mcp.agents]] are configured.
 # toolsets = ["issues", "pull_requests", "repos"]
 # Idle TTL for MCP session → identity pinning.
 # session_ttl_secs = 3600
+
+# Per-agent authentication + default-deny tool allowlists (Phase 2a).
+# When any [[mcp.agents]] entry exists, EVERY /mcp request must present a
+# valid X-Ghpool-Key header. tools/call for a tool not on the agent's
+# allowlist is rejected at the proxy (403); the allowlist is also injected
+# upstream as X-MCP-Tools. No entries = Phase 1 network-trust mode.
+#
+# Keys support the same secret references as identity tokens.
+# [[mcp.agents]]
+# id = "openab-bot"
+# key = "aws:secretsmanager:ghpool/mcp-keys:openab"   # or env:GHPOOL_KEY_OPENAB
+# tools = ["issue_read", "list_issues", "pull_request_read"]
+#
+# [[mcp.agents]]
+# id = "ci-agent"
+# key = "env:GHPOOL_KEY_CI"
+# tools = ["get_file_contents", "list_commits"]

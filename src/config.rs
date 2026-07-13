@@ -68,11 +68,32 @@ pub struct McpConfig {
     #[serde(default = "default_mcp_upstream")]
     pub upstream: String,
     /// Optional toolset restriction, injected as X-MCP-Toolsets header.
+    /// Only used when no [[mcp.agents]] are configured (Phase 1 mode).
     #[serde(default)]
     pub toolsets: Vec<String>,
     /// Idle TTL for session → identity pinning.
     #[serde(default = "default_mcp_session_ttl")]
     pub session_ttl_secs: u64,
+    /// Per-agent authentication + default-deny tool allowlists (Phase 2a).
+    /// Empty = Phase 1 network-trust mode (no agent authn on /mcp).
+    /// Non-empty = every /mcp request must present a valid X-Ghpool-Key.
+    #[serde(default)]
+    pub agents: Vec<McpAgentConfig>,
+}
+
+/// One authenticated MCP agent: key → identity → tool allowlist.
+#[derive(Clone, Deserialize)]
+pub struct McpAgentConfig {
+    pub id: String,
+    /// Shared key presented via X-Ghpool-Key. Supports the same secret
+    /// reference formats as identity tokens (env:/aws:secretsmanager:/k8s:);
+    /// resolved at config load.
+    pub key: String,
+    /// Default-deny tool allowlist (exact upstream tool names, e.g.
+    /// "issue_read"). tools/call for anything not listed is rejected at the
+    /// proxy; the same list is injected upstream as X-MCP-Tools.
+    #[serde(default)]
+    pub tools: Vec<String>,
 }
 
 impl Default for McpConfig {
@@ -82,6 +103,7 @@ impl Default for McpConfig {
             upstream: default_mcp_upstream(),
             toolsets: Vec::new(),
             session_ttl_secs: default_mcp_session_ttl(),
+            agents: Vec::new(),
         }
     }
 }
@@ -159,12 +181,16 @@ impl Config {
             let token = resolve_secret(&ri.token).await;
             identities.push(IdentityConfig { id: ri.id, token });
         }
+        let mut mcp = raw.mcp;
+        for agent in &mut mcp.agents {
+            agent.key = resolve_secret(&agent.key).await;
+        }
         Config {
             port: raw.port,
             identities,
             allowed_owners: raw.allowed_owners,
             cache: raw.cache,
-            mcp: raw.mcp,
+            mcp,
         }
     }
 

@@ -250,7 +250,7 @@ If a mutation request has no `Authorization` header, ghpool returns `401`.
 
 Reverse proxy to [GitHub's hosted MCP server](https://github.com/github/github-mcp-server): agents connect a Model Context Protocol client to ghpool and get GitHub's official MCP tools — **with no GitHub credential on the agent**. ghpool strips any client `Authorization` header and injects a pooled credential upstream.
 
-> **Status: Phase 1 — read-only, disabled by default.** The upstream is pinned to the `/readonly` tool surface. Write access ships with per-agent authentication and default-deny policy in Phase 2 — see the [RFC](https://github.com/openabdev/ghpool/issues/15).
+> **Status: read-only.** The upstream is pinned to the `/readonly` tool surface. Per-agent authentication and default-deny tool allowlists are available (Phase 2a below). Write access ships with the rest of Phase 2 — see the [RFC](https://github.com/openabdev/ghpool/issues/15).
 
 ```
 ┌───────────────── Private Network / VPC ─────────────────┐
@@ -291,6 +291,38 @@ Behavior notes:
 - **Tool names differ from the write server** — the readonly surface uses e.g. `issue_read`, not `get_issue`. Discover them via `tools/list`.
 - **Audit log** — every JSON-RPC frame is logged with method, tool name, identity, and session: `MCP tools/call issue_read [via alice] [session=7b86a7eb]`.
 - **`allowed_owners` is not enforced on `/mcp`** in Phase 1 — access is bounded by the pooled credential's own permissions and the read-only upstream. Per-agent repo allowlists arrive in Phase 2.
+
+#### Per-agent authentication (Phase 2a)
+
+Add `[[mcp.agents]]` entries to require an API key on every `/mcp` request and enforce a **default-deny tool allowlist** per agent:
+
+```toml
+[[mcp.agents]]
+id = "openab-bot"
+key = "aws:secretsmanager:ghpool/mcp-keys:openab"   # env:/k8s: refs also work
+tools = ["issue_read", "list_issues", "pull_request_read"]
+```
+
+- With any agent configured, requests without a valid `X-Ghpool-Key` get `401`; a `tools/call` for a tool not on the agent's allowlist gets `403` at the proxy — it never reaches GitHub. The allowlist is also injected upstream as `X-MCP-Tools`, so `tools/list` natively shows the agent only its permitted tools.
+- New upstream tools are **denied by default** until added to an agent's `tools` list.
+- The key is a **ghpool credential, not a GitHub credential** — a leak is bounded by that agent's allowlist and revoked by editing ghpool config, without touching GitHub.
+- Audit lines include the agent: `MCP tools/call issue_read [agent=openab-bot via alice] [session=…]`.
+- Terminate TLS in front of ghpool (ALB, ingress, mesh) in production — the key travels in a header.
+
+Client config gains one line:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "url": "http://ghpool.<namespace>:8080/mcp",
+      "headers": { "X-Ghpool-Key": "${GHPOOL_KEY}" }
+    }
+  }
+}
+```
+
+Deliver `GHPOOL_KEY` to the agent container via ECS task secrets / K8s Secrets — most MCP clients expand `${ENV}` in config.
 
 Deployment notes:
 
