@@ -60,6 +60,11 @@ Request Flow:
     → require client Authorization header
     → passthrough to GitHub (no pooling, no caching)
     → resolve + log GitHub username from token
+
+  POST /mcp (opt-in, Phase 1: read-only)
+    → MCP Streamable HTTP reverse proxy to GitHub's hosted MCP server
+    → strip client auth, inject pooled credential, pin token per session
+    → audit-log every tools/call
 ```
 
 ## What it does
@@ -67,6 +72,7 @@ Request Flow:
 - Pools multiple GitHub PATs and routes each read request through the identity with the most remaining rate limit budget
 - Caches GitHub REST and GraphQL query responses in memory with configurable TTLs
 - Proxies GraphQL mutations with passthrough auth (client's own token, no caching)
+- **MCP reverse proxy** (opt-in) — agents connect an MCP client to `/mcp` and get GitHub's official MCP tools with **no GitHub credential on the agent**; ghpool injects a pooled credential upstream
 - Mirrors the GitHub API path structure — clients just change the base URL
 - Restricts access to configured org/owner repos only
 - Auto-resolves GitHub username from tokens for audit logging
@@ -240,6 +246,59 @@ If a mutation request has no `Authorization` header, ghpool returns `401`.
   └────────────────────────────────────────────────────────────────┘
 ```
 
+### MCP (POST/GET/DELETE /mcp) — opt-in
+
+Reverse proxy to [GitHub's hosted MCP server](https://github.com/github/github-mcp-server): agents connect a Model Context Protocol client to ghpool and get GitHub's official MCP tools — **with no GitHub credential on the agent**. ghpool strips any client `Authorization` header and injects a pooled credential upstream.
+
+> **Status: Phase 1 — read-only, disabled by default.** The upstream is pinned to the `/readonly` tool surface. Write access ships with per-agent authentication and default-deny policy in Phase 2 — see the [RFC](https://github.com/openabdev/ghpool/issues/15).
+
+```
+┌───────────────── Private Network / VPC ─────────────────┐
+│                                                         │
+│  ┌───────────────────┐         ┌────────────────────┐   │
+│  │  MCP client       │         │  ghpool            │   │
+│  │  (agent)          │  MCP    │                    │   │
+│  │                   │ ──────► │  1. strip client   │   │
+│  │  no GitHub        │  HTTP   │     Authorization  │   │
+│  │  credential       │ ◄────── │  2. pin pooled     │   │
+│  └───────────────────┘         │     token/session  │   │
+│                                │  3. audit-log      │   │
+│                                │     tools/call     │   │
+│                                └─────────┬──────────┘   │
+└──────────────────────────────────────────┼──────────────┘
+                                           │ Bearer <pooled credential>
+                                           ▼
+                            ┌──────────────────────────────┐
+                            │ api.githubcopilot.com/mcp/   │
+                            │ readonly    (hosted, GitHub- │
+                            │ maintained tool schemas)     │
+                            └──────────────────────────────┘
+```
+
+Enable it in `config.toml` (or `GHPOOL_MCP_ENABLED=true`):
+
+```toml
+[mcp]
+enabled = true
+# upstream = "https://api.githubcopilot.com/mcp/readonly"  # default
+# toolsets = ["issues", "pull_requests", "repos"]          # optional coarse filter
+# session_ttl_secs = 3600                                  # session pin idle TTL
+```
+
+Behavior notes:
+
+- **Sessions are pinned** — the pooled identity is selected at `initialize` and reused for the whole MCP session. An unknown or expired session gets `404` (per MCP spec) and the client re-initializes transparently.
+- **Tool names differ from the write server** — the readonly surface uses e.g. `issue_read`, not `get_issue`. Discover them via `tools/list`.
+- **Audit log** — every JSON-RPC frame is logged with method, tool name, identity, and session: `MCP tools/call issue_read [via alice] [session=7b86a7eb]`.
+- **`allowed_owners` is not enforced on `/mcp`** in Phase 1 — access is bounded by the pooled credential's own permissions and the read-only upstream. Per-agent repo allowlists arrive in Phase 2.
+
+Deployment notes:
+
+- Requires egress to `api.githubcopilot.com` (the only additional external dependency).
+- Run a **single replica** while MCP is enabled — session pins live in process memory. A rolling deploy terminates sessions; clients recover by re-initializing.
+- Inside a trusted network, any workload that can reach `/mcp` gets the same read-only access (same trust model as ghpool's REST reads). Put TLS and agent authentication in front before any write-capable phase.
+- If the hosted endpoint is unreachable from your network, point `upstream` at a self-hosted [`github-mcp-server`](https://github.com/github/github-mcp-server) instead — same protocol and headers.
+
 ### Management
 
 | Path | Description |
@@ -291,6 +350,39 @@ Set the GitHub API base URL to point at ghpool:
 ```sh
 export GITHUB_API_BASE=http://localhost:8080
 ```
+
+### MCP clients (agents)
+
+Point any Streamable-HTTP MCP client at ghpool — no GitHub token, no `gh` CLI, no git credentials in the agent container.
+
+Kiro CLI (`~/.kiro/settings/mcp.json`) and most JSON-configured clients:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "url": "http://ghpool.<namespace>:8080/mcp"
+    }
+  }
+}
+```
+
+Claude Code:
+
+```sh
+claude mcp add --transport http github http://ghpool.<namespace>:8080/mcp
+```
+
+Verify from the container (no `Authorization` header anywhere):
+
+```sh
+curl -s -X POST http://ghpool:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' -i | grep -i mcp-session-id
+```
+
+In Phase 2, agents will additionally present a ghpool API key (`X-Ghpool-Key` header from an env-injected secret) mapped to a per-agent tool/repo allowlist — see [#17](https://github.com/openabdev/ghpool/issues/17).
 
 ### Direct curl
 
