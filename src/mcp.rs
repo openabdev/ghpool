@@ -502,6 +502,13 @@ mod tests {
         }
     }
 
+    fn pin(identity: &str, agent: Option<&str>) -> SessionPin {
+        SessionPin {
+            identity_id: identity.to_string(),
+            agent_id: agent.map(str::to_string),
+        }
+    }
+
     fn test_state_full(
         identity_ids: &[&str],
         upstream: &str,
@@ -1193,6 +1200,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
+<<<<<<< HEAD
 
     // ---- 2b-2: write classification + repo allowlists ----
 
@@ -1341,4 +1349,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(captured.lock().unwrap().len(), 1);
     }
+=======
+>>>>>>> origin/main
 }
