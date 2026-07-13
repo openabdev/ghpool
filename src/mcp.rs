@@ -56,6 +56,13 @@ pub async fn mcp_proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Phase 2a: agent authentication. With no [[mcp.agents]] configured this
+    // is Phase 1 network-trust mode (agent = None).
+    let agent = match authenticate(&state, &headers) {
+        Ok(a) => a,
+        Err(resp) => return *resp,
+    };
+
     let session_id = headers
         .get("mcp-session-id")
         .and_then(|v| v.to_str().ok())
@@ -81,17 +88,35 @@ pub async fn mcp_proxy(
         Err(code) => return rpc_error(code, "no upstream identity available"),
     };
 
-    // Audit log (best-effort JSON-RPC frame parse)
+    // Audit log + default-deny tool allowlist (single frame parse)
     if method == Method::POST {
         if let Some((rpc_method, tool)) = frame_summary(&body) {
+            // Phase 2a enforcement: authenticated agents may only call tools
+            // on their allowlist. This is the authoritative check; the
+            // injected X-MCP-Tools header is defense-in-depth.
+            if rpc_method == "tools/call" {
+                if let (Some(agent), Some(tool_name)) = (agent, tool.as_deref()) {
+                    if !agent.tools.iter().any(|t| t == tool_name) {
+                        tracing::warn!(
+                            "MCP tools/call {} DENIED [agent={}]{}",
+                            tool_name, agent.id, session_suffix(session_id.as_deref())
+                        );
+                        return rpc_error(
+                            StatusCode::FORBIDDEN,
+                            "tool not permitted by agent policy",
+                        );
+                    }
+                }
+            }
+            let via = audit_via(agent, &identity.id);
             match tool {
                 Some(t) => tracing::info!(
-                    "MCP {} {} [via {}]{}",
-                    rpc_method, t, identity.id, session_suffix(session_id.as_deref())
+                    "MCP {} {} [{}]{}",
+                    rpc_method, t, via, session_suffix(session_id.as_deref())
                 ),
                 None => tracing::info!(
-                    "MCP {} [via {}]{}",
-                    rpc_method, identity.id, session_suffix(session_id.as_deref())
+                    "MCP {} [{}]{}",
+                    rpc_method, via, session_suffix(session_id.as_deref())
                 ),
             }
         }
@@ -117,7 +142,7 @@ pub async fn mcp_proxy(
     };
 
     let Some(upstream_headers) =
-        build_upstream_headers(&headers, &identity.token, &state.config.mcp.toolsets)
+        build_upstream_headers(&headers, &identity.token, &state.config.mcp.toolsets, agent)
     else {
         tracing::error!(
             "identity {} has a token that is not a valid header value — check secret source",
@@ -212,6 +237,47 @@ async fn pick_identity(
     state.pool.select().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
 
+/// Phase 2a agent authentication.
+/// - No [[mcp.agents]] configured → Phase 1 network-trust mode: Ok(None).
+/// - Agents configured → every request must present a valid X-Ghpool-Key;
+///   missing or unknown keys get 401 with a JSON-RPC error body.
+fn authenticate<'a>(
+    state: &'a AppState,
+    headers: &HeaderMap,
+) -> Result<Option<&'a crate::config::McpAgentConfig>, Box<Response>> {
+    let agents = &state.config.mcp.agents;
+    if agents.is_empty() {
+        return Ok(None);
+    }
+    let Some(presented) = headers.get("x-ghpool-key").and_then(|v| v.to_str().ok()) else {
+        tracing::warn!("MCP request rejected: missing X-Ghpool-Key");
+        return Err(Box::new(rpc_error(StatusCode::UNAUTHORIZED, "X-Ghpool-Key header required")));
+    };
+    for agent in agents {
+        if keys_match(&agent.key, presented) {
+            return Ok(Some(agent));
+        }
+    }
+    tracing::warn!("MCP request rejected: invalid X-Ghpool-Key");
+    Err(Box::new(rpc_error(StatusCode::UNAUTHORIZED, "invalid X-Ghpool-Key")))
+}
+
+/// Compare keys via SHA-256 digests. Comparing fixed-length digests of both
+/// values (rather than the strings themselves) means any timing variance in
+/// the equality check leaks nothing useful about the configured key.
+fn keys_match(configured: &str, presented: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(configured.as_bytes()) == Sha256::digest(presented.as_bytes())
+}
+
+/// Audit attribution: agent id when authenticated, pooled identity always.
+fn audit_via(agent: Option<&crate::config::McpAgentConfig>, identity_id: &str) -> String {
+    match agent {
+        Some(a) => format!("agent={} via {}", a.id, identity_id),
+        None => format!("via {}", identity_id),
+    }
+}
+
 /// Minimal JSON-RPC error body for proxy-level failures, so MCP clients that
 /// only speak JSON-RPC degrade gracefully.
 fn rpc_error(status: StatusCode, message: &str) -> Response {
@@ -228,10 +294,23 @@ fn rpc_error(status: StatusCode, message: &str) -> Response {
 }
 
 /// Build the upstream header set from scratch: the client's Authorization (and
-/// anything else unexpected) is never forwarded; the pooled token is injected.
+/// anything else unexpected, including any client-supplied X-MCP-*) is never
+/// forwarded; the pooled token is injected.
 /// Returns None if the configured token is not a valid header value (e.g.
 /// contains a stray newline) — callers must not panic on misconfiguration.
-fn build_upstream_headers(client: &HeaderMap, token: &str, toolsets: &[String]) -> Option<HeaderMap> {
+///
+/// Policy injection:
+/// - authenticated agent → exact per-tool allowlist via X-MCP-Tools
+///   (defense-in-depth; the authoritative check is in the handler). We do NOT
+///   use X-MCP-Toolsets for agents: it silently ignores invalid names
+///   (fail-open, #22 finding F).
+/// - Phase 1 mode (no agents) → optional global X-MCP-Toolsets, as before.
+fn build_upstream_headers(
+    client: &HeaderMap,
+    token: &str,
+    toolsets: &[String],
+    agent: Option<&crate::config::McpAgentConfig>,
+) -> Option<HeaderMap> {
     let mut h = HeaderMap::new();
     h.insert("authorization", format!("Bearer {}", token).parse().ok()?);
     h.insert(
@@ -247,9 +326,18 @@ fn build_upstream_headers(client: &HeaderMap, token: &str, toolsets: &[String]) 
     if !h.contains_key("accept") {
         h.insert("accept", "application/json, text/event-stream".parse().unwrap());
     }
-    if !toolsets.is_empty() {
-        if let Ok(v) = toolsets.join(",").parse() {
-            h.insert("x-mcp-toolsets", v);
+    match agent {
+        Some(a) if !a.tools.is_empty() => {
+            if let Ok(v) = a.tools.join(",").parse() {
+                h.insert("x-mcp-tools", v);
+            }
+        }
+        _ => {
+            if !toolsets.is_empty() {
+                if let Ok(v) = toolsets.join(",").parse() {
+                    h.insert("x-mcp-toolsets", v);
+                }
+            }
         }
     }
     Some(h)
@@ -290,6 +378,23 @@ mod tests {
     }
 
     fn test_state_with(identity_ids: &[&str], upstream: &str, toolsets: &[&str]) -> Arc<AppState> {
+        test_state_full(identity_ids, upstream, toolsets, vec![])
+    }
+
+    fn agent(id: &str, key: &str, tools: &[&str]) -> config::McpAgentConfig {
+        config::McpAgentConfig {
+            id: id.to_string(),
+            key: key.to_string(),
+            tools: tools.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn test_state_full(
+        identity_ids: &[&str],
+        upstream: &str,
+        toolsets: &[&str],
+        agents: Vec<config::McpAgentConfig>,
+    ) -> Arc<AppState> {
         let identities: Vec<config::IdentityConfig> = identity_ids
             .iter()
             .map(|id| config::IdentityConfig {
@@ -313,6 +418,7 @@ mod tests {
                     upstream: upstream.to_string(),
                     toolsets: toolsets.iter().map(|s| s.to_string()).collect(),
                     session_ttl_secs: 3600,
+                    agents,
                 },
             },
             token_users: moka::future::Cache::builder().max_capacity(10).build(),
@@ -351,7 +457,7 @@ mod tests {
         client.insert("mcp-protocol-version", "2025-06-18".parse().unwrap());
         client.insert("x-random-header", "should-not-forward".parse().unwrap());
 
-        let h = build_upstream_headers(&client, "pool-token", &[]).unwrap();
+        let h = build_upstream_headers(&client, "pool-token", &[], None).unwrap();
 
         assert_eq!(h.get("authorization").unwrap(), "Bearer pool-token");
         assert_eq!(h.get("mcp-session-id").unwrap(), "sess-abc");
@@ -366,7 +472,7 @@ mod tests {
     fn test_header_rewrite_injects_toolsets() {
         let client = HeaderMap::new();
         let toolsets = vec!["issues".to_string(), "pull_requests".to_string()];
-        let h = build_upstream_headers(&client, "t", &toolsets).unwrap();
+        let h = build_upstream_headers(&client, "t", &toolsets, None).unwrap();
         assert_eq!(h.get("x-mcp-toolsets").unwrap(), "issues,pull_requests");
     }
 
@@ -374,8 +480,8 @@ mod tests {
     fn test_header_rewrite_invalid_token_is_error_not_panic() {
         // e.g. an untrimmed env secret with a trailing newline must not panic
         let client = HeaderMap::new();
-        assert!(build_upstream_headers(&client, "tok\nen", &[]).is_none());
-        assert!(build_upstream_headers(&client, "token\n", &[]).is_none());
+        assert!(build_upstream_headers(&client, "tok\nen", &[], None).is_none());
+        assert!(build_upstream_headers(&client, "token\n", &[], None).is_none());
     }
 
     #[tokio::test]
@@ -433,6 +539,8 @@ mod tests {
         method: String,
         auth: Option<String>,
         toolsets: Option<String>,
+        tools_hdr: Option<String>,
+        ghpool_key: Option<String>,
         session: Option<String>,
         body: String,
     }
@@ -457,6 +565,8 @@ mod tests {
             method: method.to_string(),
             auth: get("authorization"),
             toolsets: get("x-mcp-toolsets"),
+            tools_hdr: get("x-mcp-tools"),
+            ghpool_key: get("x-ghpool-key"),
             session: get("mcp-session-id"),
             body: body_str.clone(),
         });
@@ -678,5 +788,193 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ---- Phase 2a: agent authn + default-deny tool allowlist ----
+
+    #[test]
+    fn test_keys_match() {
+        assert!(keys_match("secret-key-1", "secret-key-1"));
+        assert!(!keys_match("secret-key-1", "secret-key-2"));
+        assert!(!keys_match("secret-key-1", ""));
+    }
+
+    #[tokio::test]
+    async fn test_no_agents_configured_is_open_phase1_mode() {
+        // Phase 1 network-trust mode: request without any key succeeds
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(&["alice"], &url, &[], vec![]);
+        let resp = mcp_app(state)
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_agents_configured_missing_key_is_401() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![agent("bot-a", "key-a", &["issue_read"])],
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // JSON-RPC error body
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"]["message"].is_string());
+        // Upstream never sees unauthenticated requests
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_agents_configured_wrong_key_is_401() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![agent("bot-a", "key-a", &["issue_read"])],
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[("x-ghpool-key", "wrong-key")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_agent_allowed_tool_passes_with_tools_header() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &["issues"], // global toolsets must be ignored for agents
+            vec![agent("bot-a", "key-a", &["issue_read", "get_file_contents"])],
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{}}}"#,
+                &[("x-ghpool-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        // exact per-tool allowlist injected upstream
+        assert_eq!(reqs[0].tools_hdr.as_deref(), Some("issue_read,get_file_contents"));
+        // agent mode: global toolsets NOT injected
+        assert!(reqs[0].toolsets.is_none());
+        // the ghpool key itself never goes upstream
+        assert!(reqs[0].ghpool_key.is_none());
+        // pooled token injected as usual
+        assert_eq!(reqs[0].auth.as_deref(), Some("Bearer token-alice"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_denied_tool_is_403_and_never_reaches_upstream() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![agent("bot-a", "key-a", &["issue_read"])],
+        );
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_file_contents","arguments":{}}}"#,
+                &[("x-ghpool-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"]["message"].as_str().unwrap().contains("not permitted"));
+
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_agent_empty_allowlist_denies_all_tool_calls() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(&["alice"], &url, &[], vec![agent("bot-a", "key-a", &[])]);
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{}}}"#,
+                &[("x-ghpool-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_agent_non_tool_call_methods_pass() {
+        // initialize / tools/list are not tools/call — allowlist doesn't apply
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![agent("bot-a", "key-a", &["issue_read"])],
+        );
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#,
+                &[("x-ghpool-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                &[("x-ghpool-key", "key-a"), ("mcp-session-id", "mock-sess-1")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(captured.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_agents_resolve_to_correct_policy() {
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(
+            &["alice"], &url, &[],
+            vec![
+                agent("bot-a", "key-a", &["issue_read"]),
+                agent("bot-b", "key-b", &["issue_read", "list_issues"]),
+            ],
+        );
+        // bot-b may call list_issues…
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_issues","arguments":{}}}"#,
+                &[("x-ghpool-key", "key-b")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            captured.lock().unwrap()[0].tools_hdr.as_deref(),
+            Some("issue_read,list_issues")
+        );
+        // …but bot-a may not
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_issues","arguments":{}}}"#,
+                &[("x-ghpool-key", "key-a")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(captured.lock().unwrap().len(), 1);
     }
 }
