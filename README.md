@@ -61,10 +61,11 @@ Request Flow:
     → passthrough to GitHub (no pooling, no caching)
     → resolve + log GitHub username from token
 
-  POST /mcp (opt-in, Phase 1: read-only)
+  POST /mcp (opt-in; read-only by default, writes behind a hard gate)
     → MCP Streamable HTTP reverse proxy to GitHub's hosted MCP server
-    → strip client auth, inject pooled credential, pin token per session
-    → audit-log every tools/call
+    → authenticate agent (X-Ghpool-Key) → default-deny tool/repo policy
+    → inject scoped GitHub App token (or pooled PAT), pin per session
+    → audit-log every tools/call; writes fail-closed audited
 ```
 
 ## What it does
@@ -72,12 +73,14 @@ Request Flow:
 - Pools multiple GitHub PATs and routes each read request through the identity with the most remaining rate limit budget
 - Caches GitHub REST and GraphQL query responses in memory with configurable TTLs
 - Proxies GraphQL mutations with passthrough auth (client's own token, no caching)
-- **MCP reverse proxy** (opt-in) — agents connect an MCP client to `/mcp` and get GitHub's official MCP tools with **no GitHub credential on the agent**; ghpool injects a pooled credential upstream
+- **MCP reverse proxy** (opt-in) — agents connect an MCP client to `/mcp` and get GitHub's official MCP tools with **no GitHub credential on the agent**; per-agent keys + default-deny tool/repo allowlists, GitHub App credentials, and hard-gated audited writes
 - Mirrors the GitHub API path structure — clients just change the base URL
 - Restricts access to configured org/owner repos only
 - Auto-resolves GitHub username from tokens for audit logging
 
 ## Quick start
+
+> **New here? Follow the [Getting Started guide](docs/getting-started.md)** — it walks from a five-minute local run through per-agent authentication, the GitHub App backend, and enabling audited writes.
 
 ```sh
 cp config.example.toml config.toml
