@@ -223,6 +223,24 @@ impl McpConfig {
             if self.audit.is_none() {
                 return Err("enable_writes requires [mcp.audit] — writes are fail-closed audited".into());
             }
+            // Multi-installation mode: repo-less agents ride pooled PATs, and
+            // writes never run on pooled PATs — an agent allowlisting a
+            // write-classified tool must be repository-scoped.
+            if !self.github_apps.is_empty() {
+                for agent in &self.agents {
+                    if agent.repos.is_empty()
+                        && agent
+                            .tools
+                            .iter()
+                            .any(|t| crate::policy::classify_tool(t) == crate::policy::ToolKind::Write)
+                    {
+                        return Err(format!(
+                            "mcp agent '{}' allowlists write tools but has no `repos` — repo-less agents use pooled PATs and writes never run on pooled PATs",
+                            agent.id
+                        ));
+                    }
+                }
+            }
         }
         // Mutual exclusion: singular and plural forms cannot coexist
         if self.github_app.is_some() && !self.github_apps.is_empty() {
@@ -244,19 +262,14 @@ impl McpConfig {
                 }
             }
             // Multi-installation routing derives each session's credential
-            // envelope from the agent's repo allowlist, so it needs
-            // authenticated agents with fully covered, well-formed repos —
-            // for reads and writes alike.
+            // envelope from the agent's repo allowlist. Agents WITH repos
+            // must be fully covered by installations; agents WITHOUT repos
+            // keep the legacy PAT-backed read path (writes are denied for
+            // them at the proxy — writes never run on pooled PATs).
             if self.agents.is_empty() {
                 return Err("[[mcp.github_apps]] requires [[mcp.agents]] — multi-installation routing is not available in network-trust mode".into());
             }
             for agent in &self.agents {
-                if agent.repos.is_empty() {
-                    return Err(format!(
-                        "mcp agent '{}' requires a non-empty `repos` allowlist in multi-installation mode — the repo owners select the installation",
-                        agent.id
-                    ));
-                }
                 for repo_entry in &agent.repos {
                     // Strict form: `owner/name` or `owner/*` — no empty or
                     // whitespace-padded parts, no extra path segments.
@@ -649,13 +662,26 @@ mod tests {
         let m = McpConfig { github_apps: vec![entry("openabdev")], ..Default::default() };
         assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
 
-        // non-empty repos required per agent
+        // repo-less agents are allowed (legacy PAT read path)…
         let m = McpConfig {
             github_apps: vec![entry("openabdev")],
             agents: vec![multi_agent(&[])],
             ..Default::default()
         };
-        assert!(m.validate().unwrap_err().contains("non-empty `repos`"));
+        assert!(m.validate().is_ok());
+
+        // …but a repo-less agent allowlisting a WRITE tool with writes
+        // enabled is a startup error (writes never run on pooled PATs)
+        let mut wa = multi_agent(&[]);
+        wa.tools = vec!["issue_read".into(), "create_issue".into()];
+        let m = McpConfig {
+            enable_writes: true,
+            github_apps: vec![entry("openabdev")],
+            agents: vec![wa],
+            audit: Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 }),
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("pooled PATs"));
 
         // every repo owner must have a matching installation
         let m = McpConfig {
