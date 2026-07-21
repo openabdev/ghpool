@@ -119,6 +119,23 @@ pub async fn mcp_proxy(
                         "write tools are not enabled",
                     );
                 }
+                // 2b. Multi-installation mode: repo-less agents ride pooled
+                //     PATs, and writes never run on pooled PATs — even when
+                //     writes are enabled. (Also rejected at startup
+                //     validation; kept as defense-in-depth.)
+                if crate::policy::classify_tool(tool_name) == crate::policy::ToolKind::Write
+                    && state.multi_app_tokens.is_some()
+                    && agent.repos.is_empty()
+                {
+                    tracing::warn!(
+                        "MCP tools/call {} DENIED (repo-less agent uses pooled PATs) [agent={}]{}",
+                        tool_name, agent.id, session_suffix(session_id.as_deref())
+                    );
+                    return rpc_error(
+                        StatusCode::FORBIDDEN,
+                        "write tools require a repository-scoped agent",
+                    );
+                }
                 // 3. Repository allowlist (deny-if-unresolvable)
                 if !agent.repos.is_empty() {
                     match &resolved_repo {
@@ -153,7 +170,8 @@ pub async fn mcp_proxy(
 
     // Multi-installation mode: `initialize` fans out to one upstream session
     // per owner in the agent's envelope; DELETE and notifications fan out to
-    // every pinned route. Everything else is routed per-call below.
+    // every pinned route. Repo-less agents skip fan-out entirely — they keep
+    // the legacy PAT-backed path (reads only; writes are denied above).
     if state.multi_app_tokens.is_some() {
         let frame_method = frame.as_ref().map(|f| f.method.as_str()).unwrap_or("");
         if method == Method::POST && frame_method == "initialize" && session_id.is_none() {
@@ -162,7 +180,9 @@ pub async fn mcp_proxy(
                 // authenticate() already rejected keyless requests.
                 return rpc_error(StatusCode::UNAUTHORIZED, "agent authentication required");
             };
-            return multi_initialize(&state, &headers, body, agent).await;
+            if !agent.repos.is_empty() {
+                return multi_initialize(&state, &headers, body, agent).await;
+            }
         }
         if let Some(sid) = session_id.as_deref() {
             if method == Method::DELETE
@@ -702,33 +722,32 @@ async fn pick_credential(
     // New session, multi-installation mode: stateless call (initialize is
     // handled by the fan-out path before credential resolution). Route by
     // the resolved owner, or the agent's first owner for repo-less methods.
+    // Repo-less agents fall through to the PAT pool (legacy read path).
     if let Some(multi) = &state.multi_app_tokens {
-        // Validation guarantees agents exist in multi mode.
-        let Some(agent) = agent else {
-            return Err(StatusCode::UNAUTHORIZED);
-        };
-        let key = match route_owner {
-            Some(o) => o.to_lowercase(),
-            None => match route_owners(agent).into_iter().next() {
-                Some(o) => o,
-                None => return Err(StatusCode::BAD_GATEWAY),
-            },
-        };
-        let Some(provider) = multi.get(&key) else {
-            return Err(StatusCode::FORBIDDEN);
-        };
-        let envelope = scope_envelope_for_owner(agent, &key);
-        return match provider.token_scoped(&envelope).await {
-            Ok(t) => Ok(McpCredential::Routed {
-                owner: key,
-                token: t.token,
-                upstream_session: None,
-            }),
-            Err(e) => {
-                tracing::error!("App token mint failed for owner {}: {}", key, e);
-                Err(StatusCode::BAD_GATEWAY)
+        if let Some(agent) = agent {
+            let owners = route_owners(agent);
+            if let Some(first_owner) = owners.first() {
+                let key = match route_owner {
+                    Some(o) => o.to_lowercase(),
+                    None => first_owner.clone(),
+                };
+                let Some(provider) = multi.get(&key) else {
+                    return Err(StatusCode::FORBIDDEN);
+                };
+                let envelope = scope_envelope_for_owner(agent, &key);
+                return match provider.token_scoped(&envelope).await {
+                    Ok(t) => Ok(McpCredential::Routed {
+                        owner: key,
+                        token: t.token,
+                        upstream_session: None,
+                    }),
+                    Err(e) => {
+                        tracing::error!("App token mint failed for owner {}: {}", key, e);
+                        Err(StatusCode::BAD_GATEWAY)
+                    }
+                };
             }
-        };
+        }
     }
     // New session: App backend takes precedence when configured. The token
     // is scoped to the agent's repo envelope when possible (exact entries,
@@ -2901,15 +2920,27 @@ mod tests {
                 &["issue_read"],
                 &["openabdev/openab"],
             ),
+            // Repo-less agent (like the legacy b2): keeps the PAT-backed
+            // read path in multi mode, writes always denied.
+            agent_with_repos(
+                "b2pat",
+                "key-b2pat",
+                &["search_code", "issue_read", "create_issue"],
+                &[],
+            ),
         ];
         let cache_config = config::CacheConfig::default();
         let has_sink = sink.is_some();
+        let identities = vec![config::IdentityConfig {
+            id: "alice".into(),
+            token: "token-alice".into(),
+        }];
         Arc::new(AppState {
-            pool: pool::PatPool::new(&[]),
+            pool: pool::PatPool::new(&identities),
             cache: cache::Cache::new(&cache_config),
             config: config::Config {
                 port: 8080,
-                identities: vec![],
+                identities: identities.clone(),
                 allowed_owners: vec!["openabdev".to_string(), "oablab".to_string()],
                 cache: cache_config,
                 mcp: config::McpConfig {
@@ -3295,6 +3326,64 @@ mod tests {
         }
 
         assert!(state.mcp_sessions.get("sess-ghs_oablab").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_multi_repoless_agent_keeps_pat_read_path() {
+        let (url, captured) = spawn_mock_upstream_multi().await;
+        let state = test_state_multi(&url, false, None).await;
+
+        // initialize as the repo-less agent: NO fan-out — single upstream
+        // request, served by the pooled PAT, pinned normally
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b2pat")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("mcp-session-id").unwrap(), "sess-token-alice");
+        {
+            let reqs = captured.lock().unwrap();
+            assert_eq!(reqs.len(), 1, "repo-less agent must not fan out");
+            assert_eq!(reqs[0].auth.as_deref(), Some("Bearer token-alice"));
+        }
+        assert_eq!(
+            state.mcp_sessions.get("sess-token-alice").await,
+            Some(pin("alice", Some("b2pat")))
+        );
+
+        // repo-less read tools (search_code) still work on the session
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"foo"}}}"#,
+                &[("x-ghpool-key", "key-b2pat"), ("mcp-session-id", "sess-token-alice")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(captured.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_multi_repoless_agent_writes_denied_even_when_enabled() {
+        let (url, captured) = spawn_mock_upstream_multi().await;
+        let path = audit_tmp("repoless-write");
+        let sink = crate::audit::AuditSink::open(&path).unwrap();
+        // writes globally enabled — the repo-less agent must still be denied
+        let state = test_state_multi(&url, true, Some(sink)).await;
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"openab","title":"t"}}}"#,
+                &[("x-ghpool-key", "key-b2pat")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["error"]["message"].as_str().unwrap().contains("repository-scoped"));
+        assert!(captured.lock().unwrap().is_empty());
+        assert!(read_audit(&path).is_empty());
+        std::fs::remove_file(&path).ok();
     }
 
     #[tokio::test]
