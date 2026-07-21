@@ -170,9 +170,10 @@ impl AppTokenProvider {
         let _mint_guard = key_lock.lock().await;
         if let Some(t) = self.cached.lock().unwrap().get(&key) {
             if t.expires_at > unix_now() + REFRESH_MARGIN.as_secs() {
-                // fulfilled by the leader while we waited — evict our entry
-                // too in case the leader's eviction raced our map insert
-                self.mint_locks.lock().unwrap().remove(&key);
+                // fulfilled by the leader while we waited — evict our own
+                // generation too in case the leader's eviction raced our
+                // map insert
+                self.evict_mint_lock(&key, &key_lock);
                 return Ok(t.clone());
             }
         }
@@ -184,8 +185,24 @@ impl AppTokenProvider {
         // waiters already holding this Arc still serialize behind it and
         // re-check the cache; the next fresh miss creates a new lock. This
         // bounds the map to in-flight mints instead of every key ever seen.
-        self.mint_locks.lock().unwrap().remove(&key);
+        self.evict_mint_lock(&key, &key_lock);
         result
+    }
+
+    /// Remove a singleflight entry only if it is still OUR generation.
+    /// A stale waiter from an evicted generation must never remove a newer
+    /// generation's in-flight lock — that would let a third caller mint
+    /// concurrently and unboundedly repeat the race. With the ptr_eq guard,
+    /// each generation removes at most itself, so duplicate mints are
+    /// bounded to one per evicted generation.
+    fn evict_mint_lock(&self, key: &str, ours: &std::sync::Arc<tokio::sync::Mutex<()>>) {
+        let mut locks = self.mint_locks.lock().unwrap();
+        if locks
+            .get(key)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, ours))
+        {
+            locks.remove(key);
+        }
     }
 
     async fn mint(
@@ -796,5 +813,37 @@ pub(crate) mod tests {
             p.token_git(&format!("badrepo{}", i)).await.unwrap_err();
         }
         assert!(p.mint_locks.lock().unwrap().is_empty(), "evicted on failure");
+    }
+
+    #[test]
+    fn test_evict_mint_lock_is_generation_guarded() {
+        let p = AppTokenProvider::new(
+            "123".into(),
+            TEST_RSA_PEM,
+            Some(1),
+            None,
+            "http://x".into(),
+        )
+        .unwrap();
+        let gen_a = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let gen_b = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+
+        // Map holds generation B (a newer in-flight mint); a stale waiter
+        // from evicted generation A must NOT remove it.
+        p.mint_locks
+            .lock()
+            .unwrap()
+            .insert("k".into(), gen_b.clone());
+        p.evict_mint_lock("k", &gen_a);
+        assert!(
+            p.mint_locks.lock().unwrap().contains_key("k"),
+            "a stale generation must never evict a newer generation's lock"
+        );
+        // The owning generation removes itself.
+        p.evict_mint_lock("k", &gen_b);
+        assert!(p.mint_locks.lock().unwrap().is_empty());
+        // Evicting an absent key is a no-op.
+        p.evict_mint_lock("k", &gen_b);
+        assert!(p.mint_locks.lock().unwrap().is_empty());
     }
 }
