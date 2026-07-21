@@ -15,8 +15,10 @@ fn main() {
     }
 
     // git credential helper protocol: `ghp git-credential <get|store|erase>`
-    // Configure with:
-    //   git config --global credential."https://github.com".helper "!ghp git-credential"
+    // Configure as the ONLY helper for github.com (the empty --replace-all
+    // entry clears inherited helpers so nothing broader can be consulted):
+    //   git config --global --replace-all credential."https://github.com".helper ""
+    //   git config --global --add credential."https://github.com".helper "!ghp git-credential"
     //   git config --global credential."https://github.com".useHttpPath true
     if args.first().map(|s| s.as_str()) == Some("git-credential") {
         exit(git_credential(args.get(1).map(|s| s.as_str()), &ghpool_url));
@@ -233,51 +235,90 @@ fn git_credential(op: Option<&str>, base: &str) -> i32 {
             return 1;
         }
     }
-    let Ok(key) = env::var("GHPOOL_KEY") else {
-        return 1; // no key in env — decline, let git try other helpers
-    };
-
     let mut input = String::new();
     use std::io::Read as _;
     if std::io::stdin().read_to_string(&mut input).is_err() {
         return 1;
     }
-    let attrs = parse_credential_input(&input);
-    if attrs.get("protocol").map(String::as_str) != Some("https") {
-        return 1;
+    match credential_plan(&input, env::var("GHPOOL_KEY").ok()) {
+        CredentialPlan::Decline => 1,
+        CredentialPlan::Quit => credential_quit(),
+        CredentialPlan::Fetch { repo, key } => match fetch_git_credential(base, &repo, &key) {
+            Some((user, pass)) => {
+                println!("username={}", user);
+                println!("password={}", pass);
+                0
+            }
+            None => credential_quit(),
+        },
     }
-    let host_ok = matches!(
-        attrs.get("host").map(String::as_str),
-        Some("github.com") | Some("gist.github.com")
-    );
-    if !host_ok {
-        return 1;
-    }
-    let Some(repo) = attrs.get("path").and_then(|p| repo_from_path(p)) else {
-        return 1; // no owner/repo (useHttpPath not set?) — decline
-    };
+}
 
+/// Decision for a `git credential get` request, separated from I/O so the
+/// fail-closed contract is testable.
+#[derive(Debug, PartialEq)]
+enum CredentialPlan {
+    /// Not a recognized github.com HTTPS repository request: decline quietly
+    /// (exit 1) so git may consult other helpers for other hosts. Gists use
+    /// a different path model and installation authorization surface, so
+    /// gist.github.com is deliberately not recognized.
+    Decline,
+    /// Recognized github.com request that cannot be served. The caller emits
+    /// `quit=true` so git stops the helper cascade instead of falling
+    /// through to osxkeychain/GCM/gh auth — that would bypass ghpool repo
+    /// policy and audit.
+    Quit,
+    /// Recognized and serviceable: exchange GHPOOL_KEY for a short-lived
+    /// single-repo token via ghpool.
+    Fetch { repo: String, key: String },
+}
+
+fn credential_plan(input: &str, key: Option<String>) -> CredentialPlan {
+    let attrs = parse_credential_input(input);
+    if attrs.get("protocol").map(String::as_str) != Some("https") {
+        return CredentialPlan::Decline;
+    }
+    // Only github.com repository URLs are supported.
+    if attrs.get("host").map(String::as_str) != Some("github.com") {
+        return CredentialPlan::Decline;
+    }
+    // From here the request is a recognized GitHub credential request and
+    // MUST NOT fall through on any failure.
+    let Some(key) = key.filter(|k| !k.is_empty()) else {
+        return CredentialPlan::Quit;
+    };
+    let Some(repo) = attrs.get("path").and_then(|p| repo_from_path(p)) else {
+        return CredentialPlan::Quit; // useHttpPath missing/malformed
+    };
+    CredentialPlan::Fetch { repo, key }
+}
+
+/// Exchange the agent key for a single-repo token. Any failure — network,
+/// non-2xx, malformed body — returns None; the caller fails closed.
+fn fetch_git_credential(base: &str, repo: &str, key: &str) -> Option<(String, String)> {
     let url = format!("{}/git-credential?repo={}", base, repo);
     let client = reqwest::blocking::Client::new();
-    let Ok(resp) = client
+    let resp = client
         .get(&url)
         .header("X-Ghpool-Key", key)
         .timeout(std::time::Duration::from_secs(15))
         .send()
-    else {
-        return 1;
-    };
+        .ok()?;
     if !resp.status().is_success() {
-        return 1;
+        return None;
     }
-    let Ok(v) = resp.json::<serde_json::Value>() else {
-        return 1;
-    };
-    let (Some(user), Some(pass)) = (v["username"].as_str(), v["password"].as_str()) else {
-        return 1;
-    };
-    println!("username={}", user);
-    println!("password={}", pass);
+    let v = resp.json::<serde_json::Value>().ok()?;
+    match (v["username"].as_str(), v["password"].as_str()) {
+        (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
+        _ => None,
+    }
+}
+
+/// Fail closed for a recognized github.com credential request. Git's
+/// credential protocol interprets `quit=true` as "stop trying helpers and do
+/// not prompt", preventing fallback to broader stored credentials.
+fn credential_quit() -> i32 {
+    println!("quit=true");
     0
 }
 
@@ -480,5 +521,119 @@ mod git_credential_tests {
         assert_eq!(repo_from_path("justowner"), None);
         assert_eq!(repo_from_path("owner/.git"), None);
         assert_eq!(repo_from_path(""), None);
+    }
+
+    const GH_INPUT: &str = "protocol=https\nhost=github.com\npath=openabdev/openab.git\n";
+
+    #[test]
+    fn test_plan_declines_unrecognized_hosts() {
+        // Non-GitHub hosts decline quietly (exit 1) so other helpers can
+        // serve them — ghp claims no authority there.
+        for input in [
+            "protocol=https\nhost=gitlab.com\npath=o/r.git\n",
+            "protocol=https\nhost=gist.github.com\npath=abc123.git\n",
+            "protocol=http\nhost=github.com\npath=o/r.git\n", // not https
+            "host=github.com\npath=o/r.git\n",                // no protocol
+        ] {
+            assert_eq!(
+                credential_plan(input, Some("k".into())),
+                CredentialPlan::Decline,
+                "input: {:?}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_quits_for_recognized_github_failures() {
+        // A recognized github.com request must NEVER fall through to broader
+        // helpers (osxkeychain/GCM/gh auth) — every unservable case quits.
+        assert_eq!(credential_plan(GH_INPUT, None), CredentialPlan::Quit, "missing key");
+        assert_eq!(
+            credential_plan(GH_INPUT, Some(String::new())),
+            CredentialPlan::Quit,
+            "empty key"
+        );
+        assert_eq!(
+            credential_plan("protocol=https\nhost=github.com\n", Some("k".into())),
+            CredentialPlan::Quit,
+            "missing path (useHttpPath not set)"
+        );
+        assert_eq!(
+            credential_plan(
+                "protocol=https\nhost=github.com\npath=justowner\n",
+                Some("k".into())
+            ),
+            CredentialPlan::Quit,
+            "malformed path"
+        );
+    }
+
+    #[test]
+    fn test_plan_fetches_for_serviceable_request() {
+        assert_eq!(
+            credential_plan(GH_INPUT, Some("secret-key".into())),
+            CredentialPlan::Fetch {
+                repo: "openabdev/openab".into(),
+                key: "secret-key".into()
+            }
+        );
+    }
+
+    /// One-shot raw HTTP mock: serves a canned response and closes.
+    fn mock_server(response: String) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        )
+    }
+
+    #[test]
+    fn test_fetch_fails_closed_on_server_errors() {
+        // 403 from ghpool (policy denial) → None → caller emits quit=true
+        let base = mock_server(http_response("403 Forbidden", ""));
+        assert_eq!(fetch_git_credential(&base, "o/r", "k"), None);
+
+        // 200 with a malformed body → None
+        let base = mock_server(http_response("200 OK", "notjson"));
+        assert_eq!(fetch_git_credential(&base, "o/r", "k"), None);
+
+        // 200 with JSON missing the password → None
+        let base = mock_server(http_response("200 OK", r#"{"username":"x-access-token"}"#));
+        assert_eq!(fetch_git_credential(&base, "o/r", "k"), None);
+
+        // network failure (nothing listening) → None
+        assert_eq!(
+            fetch_git_credential("http://127.0.0.1:1", "o/r", "k"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_fetch_returns_credential_on_success() {
+        let base = mock_server(http_response(
+            "200 OK",
+            r#"{"username":"x-access-token","password":"ghs_short","expires_at":1}"#,
+        ));
+        assert_eq!(
+            fetch_git_credential(&base, "openabdev/openab", "k"),
+            Some(("x-access-token".into(), "ghs_short".into()))
+        );
     }
 }

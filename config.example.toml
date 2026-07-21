@@ -48,12 +48,16 @@ enabled = false
 # switches to the full write-capable surface.
 # enable_writes = false
 # Enable GET /git-credential: repository-scoped agents exchange their
-# X-Ghpool-Key for a short-lived, SINGLE-REPO GitHub App installation token
-# usable as a git-over-HTTPS credential (username `x-access-token`). Closes
-# the long-lived-PAT gap for `git push`. Same hard gate as writes: agents +
-# App backend + audit (every issuance fail-closed audited). The App needs
-# Contents: read/write for pushes. Client side: `ghp git-credential` is a
-# drop-in git credential helper (see README).
+# X-Ghpool-Key for a short-lived GitHub App installation token scoped to
+# EXACTLY ONE repository with Contents-only permissions, usable as a
+# git-over-HTTPS credential (username `x-access-token`). Closes the
+# long-lived-PAT gap for `git push`. Same hard gate as writes: agents +
+# App backend + audit (durable preflight before mint, result before the
+# token is returned). The App needs Contents: read/write for pushes. With
+# the singular [mcp.github_app] form, `owner` is REQUIRED — the explicit
+# installation_id is verified against the installation's actual account
+# before issuance. Client side: `ghp git-credential` is a drop-in git
+# credential helper (see README for the fail-closed helper setup).
 # enable_git_credentials = false
 # Max concurrent write calls per agent (0 = unlimited).
 # max_inflight_writes = 4

@@ -38,9 +38,13 @@ pub struct AppTokenProvider {
     owner: Option<String>,
     api_base: String,
     http: reqwest::Client,
-    /// Cache keyed by scope envelope ("" = installation-wide; otherwise the
-    /// sorted repo list). One credential per policy envelope.
+    /// Cache keyed by purpose + scope envelope. MCP and git credentials are
+    /// intentionally isolated: a repo-scoped MCP token may carry broader App
+    /// permissions and must never satisfy a git credential request.
     cached: Mutex<HashMap<String, AppToken>>,
+    /// Owner verified from GitHub's installation API for an explicit ID.
+    /// The configured owner label is not trusted by itself.
+    verified_owner: Mutex<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -52,6 +56,12 @@ struct TokenResponse {
 #[derive(Deserialize)]
 struct Installation {
     id: u64,
+    account: Option<InstallationAccount>,
+}
+
+#[derive(Deserialize)]
+struct InstallationAccount {
+    login: String,
 }
 
 impl AppTokenProvider {
@@ -77,6 +87,7 @@ impl AppTokenProvider {
             api_base,
             http: reqwest::Client::new(),
             cached: Mutex::new(HashMap::new()),
+            verified_owner: Mutex::new(None),
         })
     }
 
@@ -92,9 +103,31 @@ impl AppTokenProvider {
     /// enforces the boundary. Empty slice = installation-wide. Tokens are
     /// cached per envelope and refreshed near expiry.
     pub async fn token_scoped(&self, repositories: &[String]) -> Result<AppToken, String> {
+        self.token_for("mcp", repositories, None).await
+    }
+
+    /// Git-over-HTTPS credential: a distinct cache namespace and a
+    /// least-privilege permission envelope. `contents:write` is sufficient
+    /// for fetch/push and prevents the returned token from bypassing MCP tool
+    /// policy for issues, PRs, Actions, administration, etc.
+    pub async fn token_git(&self, repository: &str) -> Result<AppToken, String> {
+        self.token_for(
+            "git:contents=write",
+            &[repository.to_string()],
+            Some(serde_json::json!({ "contents": "write" })),
+        )
+        .await
+    }
+
+    async fn token_for(
+        &self,
+        purpose: &str,
+        repositories: &[String],
+        permissions: Option<serde_json::Value>,
+    ) -> Result<AppToken, String> {
         let mut envelope: Vec<String> = repositories.to_vec();
         envelope.sort();
-        let key = envelope.join(",");
+        let key = format!("{}:{}", purpose, envelope.join(","));
 
         let now = unix_now();
         if let Some(t) = self.cached.lock().unwrap().get(&key) {
@@ -102,12 +135,16 @@ impl AppTokenProvider {
                 return Ok(t.clone());
             }
         }
-        let fresh = self.mint(&envelope).await?;
+        let fresh = self.mint(&envelope, permissions.as_ref()).await?;
         self.cached.lock().unwrap().insert(key, fresh.clone());
         Ok(fresh)
     }
 
-    async fn mint(&self, repositories: &[String]) -> Result<AppToken, String> {
+    async fn mint(
+        &self,
+        repositories: &[String],
+        permissions: Option<&serde_json::Value>,
+    ) -> Result<AppToken, String> {
         let jwt = self.sign_jwt()?;
         let installation_id = self.resolve_installation(&jwt).await?;
 
@@ -115,16 +152,23 @@ impl AppTokenProvider {
             "{}/app/installations/{}/access_tokens",
             self.api_base, installation_id
         );
+        let mut body = serde_json::Map::new();
+        if !repositories.is_empty() {
+            // Scope the token to explicit repositories (names within the
+            // VERIFIED installation owner). GitHub rejects unknown repos.
+            body.insert("repositories".into(), serde_json::json!(repositories));
+        }
+        if let Some(p) = permissions {
+            body.insert("permissions".into(), p.clone());
+        }
         let mut req = self
             .http
             .post(&url)
             .header("Authorization", format!("Bearer {}", jwt))
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")));
-        if !repositories.is_empty() {
-            // Scope the token to explicit repositories (names within the
-            // installation's owner). GitHub rejects unknown repos at mint.
-            req = req.json(&serde_json::json!({ "repositories": repositories }));
+        if !body.is_empty() {
+            req = req.json(&body);
         }
         let resp = req
             .send()
@@ -154,6 +198,59 @@ impl AppTokenProvider {
             expires_at.saturating_sub(unix_now())
         );
         Ok(AppToken { token: tr.token, expires_at })
+    }
+
+    /// Verify that this provider's installation belongs to `expected_owner`.
+    /// This is mandatory before credential issuance: an explicit
+    /// installation ID plus an operator-supplied owner label is not an
+    /// identity binding. Without this API check, same-named repositories in
+    /// different accounts could receive a token under a misbound route.
+    pub async fn verify_owner(&self, expected_owner: &str) -> Result<(), String> {
+        let expected = expected_owner.to_lowercase();
+        if self
+            .verified_owner
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|o| o == expected)
+        {
+            return Ok(());
+        }
+        let jwt = self.sign_jwt()?;
+        let installation_id = self.resolve_installation(&jwt).await?;
+        let url = format!("{}/app/installations/{}", self.api_base, installation_id);
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", jwt))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
+            .send()
+            .await
+            .map_err(|e| format!("installation owner verification failed: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "installation owner verification failed: GitHub returned {}",
+                resp.status()
+            ));
+        }
+        let installation: Installation = resp
+            .json()
+            .await
+            .map_err(|e| format!("installation owner response parse failed: {}", e))?;
+        let actual = installation
+            .account
+            .ok_or_else(|| "installation owner response missing account".to_string())?
+            .login
+            .to_lowercase();
+        if actual != expected {
+            return Err(format!(
+                "installation {} belongs to owner '{}', not configured owner '{}'",
+                installation_id, actual, expected_owner
+            ));
+        }
+        *self.verified_owner.lock().unwrap() = Some(actual);
+        Ok(())
     }
 
     async fn resolve_installation(&self, jwt: &str) -> Result<u64, String> {
@@ -371,7 +468,7 @@ pub(crate) mod tests {
 
         // Force near-expiry → refresh mints again
         p.cached.lock().unwrap().insert(
-            String::new(),
+            "mcp:".to_string(),
             AppToken { token: "ghs_mock_1".into(), expires_at: unix_now() + 10 },
         );
         let t3 = p.token().await.unwrap();
@@ -389,5 +486,94 @@ pub(crate) mod tests {
         let s3 = p.token_scoped(&["ghpool".into(), "openab".into()]).await.unwrap();
         assert_eq!(s3.token, "ghs_mock_4");
         assert_eq!(MINTS.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_git_token_downscopes_permissions_and_isolates_cache() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use std::sync::Arc;
+
+        type Bodies = Arc<Mutex<Vec<serde_json::Value>>>;
+        async fn mint(
+            State(bodies): State<Bodies>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            bodies.lock().unwrap().push(body);
+            let n = bodies.lock().unwrap().len();
+            let exp = time::OffsetDateTime::from_unix_timestamp((unix_now() + 3600) as i64)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            Json(serde_json::json!({
+                "token": format!("ghs_scope_{}", n),
+                "expires_at": exp,
+            }))
+        }
+
+        let bodies: Bodies = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/app/installations/42/access_tokens", post(mint))
+            .with_state(bodies.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let p = AppTokenProvider::new(
+            "123".into(),
+            TEST_RSA_PEM,
+            Some(42),
+            None,
+            format!("http://{}", addr),
+        )
+        .unwrap();
+
+        // MCP token first: same repo, default App permissions.
+        let mcp = p.token_scoped(&["openab".into()]).await.unwrap();
+        // Git token MUST mint separately despite identical repo envelope.
+        let git = p.token_git("openab").await.unwrap();
+        assert_ne!(mcp.token, git.token);
+        // Repeated git lookup hits its own cache.
+        assert_eq!(p.token_git("openab").await.unwrap().token, git.token);
+
+        let seen = bodies.lock().unwrap();
+        assert_eq!(seen.len(), 2, "MCP and git cache namespaces must not overlap");
+        assert_eq!(seen[0]["repositories"], serde_json::json!(["openab"]));
+        assert!(seen[0].get("permissions").is_none());
+        assert_eq!(seen[1]["repositories"], serde_json::json!(["openab"]));
+        assert_eq!(
+            seen[1]["permissions"],
+            serde_json::json!({"contents": "write"})
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_owner_binds_explicit_installation_id() {
+        use axum::{routing::get, Router};
+
+        let app = Router::new().route(
+            "/app/installations/42",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "id": 42,
+                    "account": {"login": "openabdev"}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let p = AppTokenProvider::new(
+            "123".into(),
+            TEST_RSA_PEM,
+            Some(42),
+            Some("openabdev".into()),
+            format!("http://{}", addr),
+        )
+        .unwrap();
+
+        p.verify_owner("OpenABdev").await.unwrap();
+        let err = p.verify_owner("oablab").await.unwrap_err();
+        assert!(err.contains("belongs to owner 'openabdev'"));
+        assert!(err.contains("not configured owner 'oablab'"));
     }
 }

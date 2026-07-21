@@ -104,17 +104,11 @@ async fn main() {
         write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
 
-    let mut app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/stats", get(stats))
-        .route("/graphql", post(graphql_proxy))
-        .route("/raw/{*path}", get(proxy_raw))
-        .route("/{*path}", get(proxy));
+    let mut app = base_router();
 
     if config.mcp.enable_git_credentials {
         config.mcp.validate().expect("invalid [mcp] config");
         tracing::info!("git credential issuance enabled → /git-credential");
-        app = app.route("/git-credential", get(git_credential::git_credential));
     }
 
     if config.mcp.enabled {
@@ -138,6 +132,20 @@ async fn main() {
     tracing::info!("ghpool listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+/// The base route table shared by production and tests. `/git-credential` is
+/// always registered as an exact route so it takes precedence over the
+/// `/{*path}` GitHub REST catch-all: when issuance is disabled the handler
+/// returns its explicit 404 and the request is never proxied upstream.
+fn base_router() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/stats", get(stats))
+        .route("/graphql", post(graphql_proxy))
+        .route("/git-credential", get(git_credential::git_credential))
+        .route("/raw/{*path}", get(proxy_raw))
+        .route("/{*path}", get(proxy))
 }
 
 async fn healthz() -> &'static str {
@@ -463,12 +471,8 @@ mod tests {
     }
 
     fn app(state: Arc<AppState>) -> axum::Router {
-        axum::Router::new()
-            .route("/healthz", axum::routing::get(healthz))
-            .route("/stats", axum::routing::get(stats))
-            .route("/raw/{*path}", axum::routing::get(proxy_raw))
-            .route("/{*path}", axum::routing::get(proxy))
-            .with_state(state)
+        // the production route table — ordering/precedence is under test
+        base_router().with_state(state)
     }
 
     #[tokio::test]
@@ -522,5 +526,30 @@ mod tests {
         // Non-repo paths are allowed
         assert!(is_allowed_path("/rate_limit", &owners));
         assert!(is_allowed_path("/user", &owners));
+    }
+
+    #[tokio::test]
+    async fn test_git_credential_disabled_never_reaches_github_proxy() {
+        // Default McpConfig has enable_git_credentials = false. The exact
+        // /git-credential route must win over the /{*path} catch-all so the
+        // request is answered locally (404) and never proxied to GitHub.
+        let state = test_state(vec!["openabdev"]);
+        let resp = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/git-credential?repo=openabdev/openab")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("not enabled"),
+            "expected the local handler's message, got: {}",
+            text
+        );
     }
 }
