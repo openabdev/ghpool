@@ -475,6 +475,7 @@ pub async fn mcp_proxy(
     // surface when that agent explicitly allowlists the tool. The upstream
     // response remains untouched for all other agents and requests.
     if frame.as_ref().map(|f| f.method.as_str()) == Some("tools/list")
+        && state.config.mcp.enable_writes
         && custom_tool_enabled(agent, MINIMIZE_COMMENT_TOOL)
     {
         let content_type = resp
@@ -484,8 +485,12 @@ pub async fn mcp_proxy(
             .map(str::to_string);
         match buffer_body(resp, MAX_BODY_BYTES).await {
             Ok(BufferedBody::Complete(bytes)) => {
-                let body = inject_custom_tool(&bytes, content_type.as_deref())
-                    .unwrap_or(bytes);
+                let body = inject_custom_tool(
+                    &bytes,
+                    content_type.as_deref(),
+                    agent.map(|a| a.tools.as_slice()),
+                )
+                .unwrap_or(bytes);
                 return builder
                     .body(Body::from(body))
                     .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
@@ -644,25 +649,58 @@ fn custom_tool_definition() -> serde_json::Value {
     })
 }
 
-/// Append a custom tool to a JSON or SSE-framed tools/list response. A parse
-/// failure returns None so the caller can forward the upstream response
-/// unchanged rather than breaking an otherwise compatible MCP session.
-fn inject_custom_tool(body: &[u8], content_type: Option<&str>) -> Option<Vec<u8>> {
+/// Parse one JSON response from either a JSON body or an SSE event. SSE
+/// permits multiple data lines per event; those lines are joined with a
+/// newline before JSON decoding, as required by the event-stream format.
+fn parse_sse_or_json(body: &[u8], content_type: Option<&str>) -> Option<serde_json::Value> {
     let is_sse = content_type
         .map(|value| value.starts_with("text/event-stream"))
         .unwrap_or(false);
-    let mut json: serde_json::Value = if is_sse {
-        let text = std::str::from_utf8(body).ok()?;
-        let data = text
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .map(str::trim_start)
-            .next_back()?;
-        serde_json::from_str(data).ok()?
-    } else {
-        serde_json::from_slice(body).ok()?
-    };
+    if !is_sse {
+        return serde_json::from_slice(body).ok();
+    }
+
+    let text = std::str::from_utf8(body).ok()?;
+    let mut current = String::new();
+    let mut last_event = None;
+    for line in text.lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            if !current.is_empty() {
+                current.push('\n');
+            }
+            current.push_str(data.strip_prefix(' ').unwrap_or(data));
+        } else if line.is_empty() && !current.is_empty() {
+            last_event = Some(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        last_event = Some(current);
+    }
+    serde_json::from_str(last_event?.as_str()).ok()
+}
+
+/// Append a custom tool to a JSON or SSE-framed tools/list response and filter
+/// upstream tools against the authenticated agent's complete allowlist. A
+/// parse failure returns None so the caller can forward the upstream response
+/// unchanged rather than breaking an otherwise compatible MCP session.
+fn inject_custom_tool(
+    body: &[u8],
+    content_type: Option<&str>,
+    allowed_tools: Option<&[String]>,
+) -> Option<Vec<u8>> {
+    let is_sse = content_type
+        .map(|value| value.starts_with("text/event-stream"))
+        .unwrap_or(false);
+    let mut json = parse_sse_or_json(body, content_type)?;
     let tools = json.get_mut("result")?.get_mut("tools")?.as_array_mut()?;
+    if let Some(allowed) = allowed_tools {
+        tools.retain(|tool| {
+            tool.get("name")
+                .and_then(|name| name.as_str())
+                .map(|name| allowed.iter().any(|candidate| candidate == name))
+                .unwrap_or(false)
+        });
+    }
     if !tools.iter().any(|tool| {
         tool.get("name")
             .and_then(|name| name.as_str())
@@ -681,6 +719,7 @@ fn inject_custom_tool(body: &[u8], content_type: Option<&str>) -> Option<Vec<u8>
 fn tool_response(
     rpc_id: Option<&serde_json::Value>,
     is_error: bool,
+    http_status: StatusCode,
     text: impl Into<String>,
 ) -> Response {
     let body = serde_json::json!({
@@ -692,7 +731,7 @@ fn tool_response(
         }
     });
     Response::builder()
-        .status(StatusCode::OK)
+        .status(http_status)
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .expect("static MCP tool response")
@@ -704,7 +743,7 @@ fn local_tool_error(
     message: impl Into<String>,
 ) -> LocalToolResponse {
     LocalToolResponse {
-        response: tool_response(rpc_id, true, message),
+        response: tool_response(rpc_id, true, http_status, message),
         http_status: http_status.as_u16(),
         tool_error: Some(true),
     }
@@ -765,7 +804,7 @@ async fn handle_minimize_comment(
     }
 
     let verify_payload = serde_json::json!({
-        "query": "query VerifyComment($id: ID!) { viewer { login } node(id: $id) { ... on IssueComment { author { login } } ... on PullRequestReviewComment { author { login } } } }",
+        "query": "query VerifyComment($id: ID!) { viewer { login } node(id: $id) { ... on IssueComment { author { login } issue { repository { nameWithOwner } } } ... on PullRequestReviewComment { author { login } pullRequest { repository { nameWithOwner } } } } }",
         "variables": { "id": node_id }
     });
     let (verify_status, verify_body) = match execute_graphql(state, cred, &verify_payload).await {
@@ -780,6 +819,11 @@ async fn handle_minimize_comment(
     };
     let viewer = verify_body.pointer("/data/viewer/login").and_then(|value| value.as_str());
     let author = verify_body.pointer("/data/node/author/login").and_then(|value| value.as_str());
+    let actual_repo = verify_body
+        .pointer("/data/node/issue/repository/nameWithOwner")
+        .or_else(|| verify_body.pointer("/data/node/pullRequest/repository/nameWithOwner"))
+        .and_then(|value| value.as_str());
+    let expected_repo = format!("{}/{}", owner, repo);
     if !verify_status.is_success()
         || verify_body.get("errors").is_some()
         || viewer.is_none()
@@ -791,6 +835,21 @@ async fn handle_minimize_comment(
             frame.rpc_id.as_ref(),
             verify_status,
             "comment is not authored by the current GitHub identity",
+        );
+    }
+    if actual_repo
+        .map(|value| value.eq_ignore_ascii_case(&expected_repo))
+        != Some(true)
+    {
+        tracing::warn!(
+            "comment repository mismatch: expected {}, actual {:?}",
+            expected_repo,
+            actual_repo
+        );
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::FORBIDDEN,
+            "comment does not belong to the authorized repository",
         );
     }
 
@@ -822,6 +881,7 @@ async fn handle_minimize_comment(
         response: tool_response(
             frame.rpc_id.as_ref(),
             false,
+            StatusCode::OK,
             format!("Comment minimized as {}", classifier),
         ),
         http_status: status.as_u16(),
@@ -1785,7 +1845,7 @@ mod tests {
     #[test]
     fn test_inject_custom_tool_json_response() {
         let body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
-        let injected = inject_custom_tool(body, Some("application/json")).unwrap();
+        let injected = inject_custom_tool(body, Some("application/json"), None).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(json["result"]["tools"][0]["name"], MINIMIZE_COMMENT_TOOL);
     }
@@ -1796,7 +1856,7 @@ mod tests {
 data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
 
 "#;
-        let injected = inject_custom_tool(body, Some("text/event-stream")).unwrap();
+        let injected = inject_custom_tool(body, Some("text/event-stream"), None).unwrap();
         assert!(String::from_utf8(injected).unwrap().contains(MINIMIZE_COMMENT_TOOL));
     }
 
@@ -1806,9 +1866,52 @@ data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
             r#"{{"jsonrpc":"2.0","id":1,"result":{{"tools":[{{"name":"{}"}}]}}}}"#,
             MINIMIZE_COMMENT_TOOL
         );
-        let injected = inject_custom_tool(body.as_bytes(), Some("application/json")).unwrap();
+        let injected = inject_custom_tool(body.as_bytes(), Some("application/json"), None).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(json["result"]["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_inject_custom_tool_filters_to_allowlist() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"issue_read"},{"name":"create_issue"}]}}"#;
+        let allowed = vec![MINIMIZE_COMMENT_TOOL.to_string(), "issue_read".to_string()];
+        let injected = inject_custom_tool(body, Some("application/json"), Some(&allowed)).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+        let names: Vec<&str> = json["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["issue_read", MINIMIZE_COMMENT_TOOL]);
+    }
+
+    #[test]
+    fn test_custom_tool_enabled_requires_allowlist_match() {
+        let allowed = agent("review", "key", &[MINIMIZE_COMMENT_TOOL]);
+        let other = agent("other", "key", &["issue_read"]);
+        assert!(custom_tool_enabled(Some(&allowed), MINIMIZE_COMMENT_TOOL));
+        assert!(!custom_tool_enabled(Some(&other), MINIMIZE_COMMENT_TOOL));
+        assert!(!custom_tool_enabled(None, MINIMIZE_COMMENT_TOOL));
+    }
+
+    #[test]
+    fn test_header_filter_preserves_upstream_tools() {
+        let client = HeaderMap::new();
+        let allowed = agent("review", "key", &[MINIMIZE_COMMENT_TOOL, "issue_read"]);
+        let headers = build_upstream_headers(&client, "token", &[], Some(&allowed)).unwrap();
+        assert_eq!(headers.get("x-mcp-tools").unwrap(), "issue_read");
+    }
+
+    #[test]
+    fn test_parse_sse_or_json_joins_multiline_data() {
+        let body = br#"event: message
+data: {"jsonrpc":"2.0",
+data: "id":1,"result":{"tools":[]}}
+
+"#;
+        let parsed = parse_sse_or_json(body, Some("text/event-stream")).unwrap();
+        assert_eq!(parsed["result"]["tools"].as_array().unwrap().len(), 0);
     }
 
     #[test]

@@ -24,10 +24,11 @@ against GitHub directly.
 ghpool is a **credential-swapping reverse proxy with a default-deny policy
 engine**, sitting between agents and two GitHub surfaces:
 
-- **MCP** (`/mcp`) → GitHub's hosted MCP server (`api.githubcopilot.com/mcp/`).
-  ghpool proxies the official tool schemas verbatim — it defines no tools of
-  its own (the Revision 1→2 pivot). Zero schema maintenance; new upstream
-  tools appear automatically but are **denied by default** until granted.
+- **MCP** (`/mcp`) -> GitHub's hosted MCP server (`api.githubcopilot.com/mcp/`), with a
+  narrowly scoped ghpool-owned review-tool exception. Upstream schemas remain
+  proxied verbatim; `ghpool_*` tools are explicit, default-deny, App-backed,
+  repository-bound, and fail-closed audited. ghpool does not expose arbitrary
+  GraphQL or a general custom-tool registry.
 - **REST/GraphQL** (`/{path}`, `/graphql`) → `api.github.com`, with PAT
   pooling (budget-aware selection) and in-memory read caching. GraphQL
   mutations pass through with the client's own token (full attribution).
@@ -149,3 +150,4 @@ caller.
 | Buffer + parse write responses | #17 review | `isError` inside HTTP 200; audit must record tool outcome |
 | Scoped installation tokens per policy envelope | #17 review | GitHub enforces the repo boundary, not just our parser |
 | Writes: App + audit + agents required in code | #17 review | Hard rules, not documented hopes |
+| `ghpool_*` review tools as a narrow MCP exception | #44 / PR #45 | Fill upstream capability gaps without arbitrary GraphQL; preserve default-deny, repo binding, App credentials, and audit |
