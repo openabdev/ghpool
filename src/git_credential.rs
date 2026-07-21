@@ -43,12 +43,19 @@ pub async fn git_credential(
         Err(resp) => return *resp,
     };
 
-    // Exactly one repository per credential: owner/name, strict shape.
+    // Exactly one repository per credential: owner/name, strict shape AND
+    // strict charset (GitHub logins: alphanumeric + hyphen; repo names:
+    // alphanumeric + `-_.`). Percent-encoded or exotic input is rejected
+    // here — before the allowlist, audit preflight, or any mint attempt.
     let Some((owner, name)) = params
         .get("repo")
         .and_then(|r| r.split_once('/'))
         .filter(|(o, n)| {
-            !o.is_empty() && !n.is_empty() && !n.contains('/') && *o == o.trim() && *n == n.trim()
+            !o.is_empty()
+                && !n.is_empty()
+                && o.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && n.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
         })
     else {
         return rpc_error(StatusCode::BAD_REQUEST, "repo=<owner>/<name> query required");
@@ -496,9 +503,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        // malformed repo params, including an encoded owner/name/extra form
-        // (%2F decodes back to '/' and must still be rejected)
-        for bad in ["justanowner", "openabdev%2Fopenab%2Fx", "openabdev/", "/openab"] {
+        // malformed repo params, including encoded and exotic-charset forms
+        // (%2F decodes back to '/'; charset validation rejects the rest)
+        for bad in [
+            "justanowner",
+            "openabdev%2Fopenab%2Fx",
+            "openabdev/",
+            "/openab",
+            "openabdev/open%20ab", // decodes to a space
+            "openabdev/open+ab",   // '+' decodes to a space
+            "open~abdev/openab",   // invalid owner charset
+        ] {
             let resp = app(state.clone())
                 .oneshot(req(bad, Some("key-b0")))
                 .await

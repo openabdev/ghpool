@@ -23,6 +23,11 @@ use serde::Deserialize;
 /// handed to an in-flight request stays valid for the request's lifetime.
 const REFRESH_MARGIN: Duration = Duration::from_secs(300);
 
+/// Owner verification is re-checked this often. GitHub accounts can rename
+/// (and freed names can be re-claimed), so a verified owner→installation
+/// binding must not live for the whole process lifetime.
+const VERIFY_TTL: Duration = Duration::from_secs(3600);
+
 /// A minted installation token plus its expiry (unix seconds).
 #[derive(Clone, Debug)]
 pub struct AppToken {
@@ -42,9 +47,14 @@ pub struct AppTokenProvider {
     /// intentionally isolated: a repo-scoped MCP token may carry broader App
     /// permissions and must never satisfy a git credential request.
     cached: Mutex<HashMap<String, AppToken>>,
-    /// Owner verified from GitHub's installation API for an explicit ID.
-    /// The configured owner label is not trusted by itself.
-    verified_owner: Mutex<Option<String>>,
+    /// Serializes mints so concurrent cache misses for the same key don't
+    /// each mint a token (waste + audit noise). Held across the mint await;
+    /// contention is negligible at this call rate.
+    mint_lock: tokio::sync::Mutex<()>,
+    /// Owner verified from GitHub's installation API for an explicit ID,
+    /// with the verification time — re-checked after VERIFY_TTL. The
+    /// configured owner label is not trusted by itself.
+    verified_owner: Mutex<Option<(String, u64)>>,
 }
 
 #[derive(Deserialize)]
@@ -87,6 +97,7 @@ impl AppTokenProvider {
             api_base,
             http: reqwest::Client::new(),
             cached: Mutex::new(HashMap::new()),
+            mint_lock: tokio::sync::Mutex::new(()),
             verified_owner: Mutex::new(None),
         })
     }
@@ -132,6 +143,14 @@ impl AppTokenProvider {
         let now = unix_now();
         if let Some(t) = self.cached.lock().unwrap().get(&key) {
             if t.expires_at > now + REFRESH_MARGIN.as_secs() {
+                return Ok(t.clone());
+            }
+        }
+        // Singleflight: concurrent misses for the same key wait here, then
+        // re-check the cache so only the first caller actually mints.
+        let _mint_guard = self.mint_lock.lock().await;
+        if let Some(t) = self.cached.lock().unwrap().get(&key) {
+            if t.expires_at > unix_now() + REFRESH_MARGIN.as_secs() {
                 return Ok(t.clone());
             }
         }
@@ -211,8 +230,8 @@ impl AppTokenProvider {
             .verified_owner
             .lock()
             .unwrap()
-            .as_deref()
-            .is_some_and(|o| o == expected)
+            .as_ref()
+            .is_some_and(|(o, at)| *o == expected && at + VERIFY_TTL.as_secs() > unix_now())
         {
             return Ok(());
         }
@@ -249,7 +268,7 @@ impl AppTokenProvider {
                 installation_id, actual, expected_owner
             ));
         }
-        *self.verified_owner.lock().unwrap() = Some(actual);
+        *self.verified_owner.lock().unwrap() = Some((actual, unix_now()));
         Ok(())
     }
 
@@ -549,10 +568,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_verify_owner_binds_explicit_installation_id() {
         use axum::{routing::get, Router};
+        use std::sync::atomic::{AtomicU32, Ordering};
 
+        static HITS: AtomicU32 = AtomicU32::new(0);
         let app = Router::new().route(
             "/app/installations/42",
             get(|| async {
+                HITS.fetch_add(1, Ordering::SeqCst);
                 axum::Json(serde_json::json!({
                     "id": 42,
                     "account": {"login": "openabdev"}
@@ -572,8 +594,68 @@ pub(crate) mod tests {
         .unwrap();
 
         p.verify_owner("OpenABdev").await.unwrap();
+        assert_eq!(HITS.load(Ordering::SeqCst), 1);
+        // fresh verification is cached — no second API call
+        p.verify_owner("openabdev").await.unwrap();
+        assert_eq!(HITS.load(Ordering::SeqCst), 1);
+        // a stale verification (past VERIFY_TTL) is re-checked with GitHub:
+        // orgs can rename, so the binding must not live forever
+        *p.verified_owner.lock().unwrap() =
+            Some(("openabdev".into(), unix_now() - VERIFY_TTL.as_secs() - 1));
+        p.verify_owner("openabdev").await.unwrap();
+        assert_eq!(HITS.load(Ordering::SeqCst), 2);
+
         let err = p.verify_owner("oablab").await.unwrap_err();
         assert!(err.contains("belongs to owner 'openabdev'"));
         assert!(err.contains("not configured owner 'oablab'"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_misses_mint_once() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        static MINTS2: AtomicU32 = AtomicU32::new(0);
+        let app = Router::new().route(
+            "/app/installations/7/access_tokens",
+            post(|| async {
+                MINTS2.fetch_add(1, Ordering::SeqCst);
+                // slow mint so concurrent callers overlap the await
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let exp = time::OffsetDateTime::from_unix_timestamp((unix_now() + 3600) as i64)
+                    .unwrap()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap();
+                axum::Json(serde_json::json!({"token": "ghs_single", "expires_at": exp}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let p = Arc::new(
+            AppTokenProvider::new(
+                "123".into(),
+                TEST_RSA_PEM,
+                Some(7),
+                None,
+                format!("http://{}", addr),
+            )
+            .unwrap(),
+        );
+        let (a, b, c) = tokio::join!(
+            p.token_git("openab"),
+            p.token_git("openab"),
+            p.token_git("openab"),
+        );
+        assert_eq!(a.unwrap().token, "ghs_single");
+        assert_eq!(b.unwrap().token, "ghs_single");
+        assert_eq!(c.unwrap().token, "ghs_single");
+        assert_eq!(
+            MINTS2.load(Ordering::SeqCst),
+            1,
+            "singleflight: concurrent misses must mint exactly once"
+        );
     }
 }

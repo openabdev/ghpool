@@ -278,12 +278,26 @@ fn credential_plan(input: &str, key: Option<String>) -> CredentialPlan {
     if attrs.get("protocol").map(String::as_str) != Some("https") {
         return CredentialPlan::Decline;
     }
-    // Only github.com repository URLs are supported.
-    if attrs.get("host").map(String::as_str) != Some("github.com") {
+    // Only github.com repository URLs are supported. Hostnames are
+    // case-insensitive and git passes an explicit port through in `host`
+    // (e.g. `GitHub.com`, `github.com:443`) — normalize before matching so
+    // no github.com variant can slip past to a broader helper.
+    let host = attrs
+        .get("host")
+        .map(|h| h.to_ascii_lowercase())
+        .unwrap_or_default();
+    let (hostname, port) = match host.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (host.as_str(), None),
+    };
+    if hostname != "github.com" {
         return CredentialPlan::Decline;
     }
     // From here the request is a recognized GitHub credential request and
     // MUST NOT fall through on any failure.
+    if !matches!(port, None | Some("443")) {
+        return CredentialPlan::Quit; // github.com on a non-HTTPS port
+    }
     let Some(key) = key.filter(|k| !k.is_empty()) else {
         return CredentialPlan::Quit;
     };
@@ -335,13 +349,28 @@ fn parse_credential_input(input: &str) -> std::collections::HashMap<String, Stri
 }
 
 /// `owner/repo` from a git request path: strips a trailing `.git` and any
-/// extra segments (`owner/repo/info/refs` → `owner/repo`).
+/// extra segments (`owner/repo/info/refs` → `owner/repo`). Both components
+/// must match GitHub's identifier charset — anything else (percent-encoding,
+/// whitespace, control chars, unicode) is refused so the value is provably
+/// safe to interpolate into the ghpool query string.
 fn repo_from_path(path: &str) -> Option<String> {
     let mut parts = path.trim_start_matches('/').splitn(3, '/');
     let owner = parts.next().filter(|s| !s.is_empty())?;
     let repo = parts.next().filter(|s| !s.is_empty())?;
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
     if repo.is_empty() {
+        return None;
+    }
+    if !owner
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return None;
+    }
+    if !repo
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
         return None;
     }
     Some(format!("{}/{}", owner, repo))
@@ -532,6 +561,7 @@ mod git_credential_tests {
         for input in [
             "protocol=https\nhost=gitlab.com\npath=o/r.git\n",
             "protocol=https\nhost=gist.github.com\npath=abc123.git\n",
+            "protocol=https\nhost=evil-github.com\npath=o/r.git\n",
             "protocol=http\nhost=github.com\npath=o/r.git\n", // not https
             "host=github.com\npath=o/r.git\n",                // no protocol
         ] {
@@ -542,6 +572,37 @@ mod git_credential_tests {
                 input
             );
         }
+    }
+
+    #[test]
+    fn test_plan_recognizes_github_host_variants() {
+        // Hostnames are case-insensitive and git passes explicit ports
+        // through in `host` — every github.com variant must be recognized,
+        // never handed to a broader helper.
+        for host in ["github.com", "GitHub.com", "GITHUB.COM", "github.com:443"] {
+            let input = format!("protocol=https\nhost={}\npath=o/r.git\n", host);
+            assert_eq!(
+                credential_plan(&input, Some("k".into())),
+                CredentialPlan::Fetch { repo: "o/r".into(), key: "k".into() },
+                "host: {}",
+                host
+            );
+            // …and still fail closed (never decline) when unservable
+            assert_eq!(
+                credential_plan(&input, None),
+                CredentialPlan::Quit,
+                "host {} without key must quit, not decline",
+                host
+            );
+        }
+        // github.com on a non-HTTPS port: recognized but unsupported → quit
+        assert_eq!(
+            credential_plan(
+                "protocol=https\nhost=github.com:8443\npath=o/r.git\n",
+                Some("k".into())
+            ),
+            CredentialPlan::Quit
+        );
     }
 
     #[test]
@@ -559,14 +620,23 @@ mod git_credential_tests {
             CredentialPlan::Quit,
             "missing path (useHttpPath not set)"
         );
-        assert_eq!(
-            credential_plan(
-                "protocol=https\nhost=github.com\npath=justowner\n",
-                Some("k".into())
-            ),
-            CredentialPlan::Quit,
-            "malformed path"
-        );
+        for bad_path in [
+            "justowner",
+            "owner/re%2Fpo",     // percent-encoding
+            "owner/re po",       // whitespace
+            "owner/r\u{00e9}po", // non-ASCII
+            "own~er/repo",       // invalid owner charset
+        ] {
+            assert_eq!(
+                credential_plan(
+                    &format!("protocol=https\nhost=github.com\npath={}\n", bad_path),
+                    Some("k".into())
+                ),
+                CredentialPlan::Quit,
+                "path: {:?}",
+                bad_path
+            );
+        }
     }
 
     #[test]

@@ -510,7 +510,8 @@ Properties:
   are cached separately from MCP tokens.
 - **Owner binding** — the configured owner label is verified against the
   actual installation account (`GET /app/installations/{id}`) before
-  issuance; a mislabeled installation ID is refused.
+  issuance and re-verified hourly (accounts can rename); a mislabeled
+  installation ID is refused.
 - **Fail-closed audit** — a request record is persisted *before* any mint or
   cache lookup, and a result record before the token is returned; if either
   write fails, no credential (503). The token value is never written to the
