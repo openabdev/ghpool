@@ -382,6 +382,19 @@ Required GitHub App permissions (grant only what your agents' tools need):
 | `get_file_contents`, `create_or_update_file`, `push_files` | Contents: read / write |
 | `list_workflows`, `run_workflow` | Actions: read / write |
 
+
+#### ghpool-owned review tools (issue #44 MVP)
+
+When writes are enabled and an authenticated agent explicitly includes the tool in its allowlist, `tools/list` also advertises:
+
+```text
+ghpool_review_minimize_comment
+```
+
+The tool accepts `owner`, `repo`, `node_id`, and a `classifier` (`ABUSE`, `DUPLICATE`, `OFF_TOPIC`, `OUTDATED`, `RESOLVED`, or `SPAM`). Before mutating, it verifies that the target is an issue/PR comment authored by the current GitHub identity, then executes GitHub's `minimizeComment` GraphQL mutation locally through ghpool's scoped GitHub App credential; it is not forwarded to the upstream MCP server. The call uses the same repository policy, write gate, in-flight limit, and fail-closed audit as upstream write tools. Agents that do not explicitly allowlist the name neither see it in `tools/list` nor can call it.
+
+This is intentionally a narrow extension point: ghpool does not expose arbitrary GraphQL, and upstream GitHub MCP tools remain unchanged.
+
 The tool surface returned by `tools/list` shrinks to match the App's actual permissions (verified in the [#22 spike](https://github.com/openabdev/ghpool/issues/22)) — grant conservatively and expand as agents need more.
 
 #### Multi-installation routing (one key, many orgs)
