@@ -2,6 +2,7 @@ mod app_token;
 mod audit;
 mod cache;
 mod config;
+mod git_credential;
 mod mcp;
 mod policy;
 mod pool;
@@ -109,6 +110,12 @@ async fn main() {
         .route("/graphql", post(graphql_proxy))
         .route("/raw/{*path}", get(proxy_raw))
         .route("/{*path}", get(proxy));
+
+    if config.mcp.enable_git_credentials {
+        config.mcp.validate().expect("invalid [mcp] config");
+        tracing::info!("git credential issuance enabled → /git-credential");
+        app = app.route("/git-credential", get(git_credential::git_credential));
+    }
 
     if config.mcp.enabled {
         config.mcp.validate().expect("invalid [mcp] config");

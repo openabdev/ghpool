@@ -14,6 +14,14 @@ fn main() {
         exit(0);
     }
 
+    // git credential helper protocol: `ghp git-credential <get|store|erase>`
+    // Configure with:
+    //   git config --global credential."https://github.com".helper "!ghp git-credential"
+    //   git config --global credential."https://github.com".useHttpPath true
+    if args.first().map(|s| s.as_str()) == Some("git-credential") {
+        exit(git_credential(args.get(1).map(|s| s.as_str()), &ghpool_url));
+    }
+
     // Try to handle as a pooled read via ghpool REST
     if let Some(code) = try_pooled(&args, &ghpool_url) {
         exit(code);
@@ -209,6 +217,95 @@ fn http_get(url: &str) -> Option<String> {
     reqwest::blocking::get(url).ok()?.text().ok()
 }
 
+/// Git credential helper backed by ghpool's /git-credential endpoint:
+/// exchanges GHPOOL_KEY for a short-lived, single-repo GitHub App
+/// installation token. Only the `get` operation does anything; `store`
+/// and `erase` are no-ops (tokens are ephemeral, nothing to persist).
+///
+/// Exit codes: 0 with output = credential provided; 1 = decline quietly so
+/// git falls through to the next configured helper (if any).
+fn git_credential(op: Option<&str>, base: &str) -> i32 {
+    match op {
+        Some("get") => {}
+        Some("store") | Some("erase") => return 0,
+        _ => {
+            eprintln!("usage: ghp git-credential <get|store|erase>");
+            return 1;
+        }
+    }
+    let Ok(key) = env::var("GHPOOL_KEY") else {
+        return 1; // no key in env — decline, let git try other helpers
+    };
+
+    let mut input = String::new();
+    use std::io::Read as _;
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return 1;
+    }
+    let attrs = parse_credential_input(&input);
+    if attrs.get("protocol").map(String::as_str) != Some("https") {
+        return 1;
+    }
+    let host_ok = matches!(
+        attrs.get("host").map(String::as_str),
+        Some("github.com") | Some("gist.github.com")
+    );
+    if !host_ok {
+        return 1;
+    }
+    let Some(repo) = attrs.get("path").and_then(|p| repo_from_path(p)) else {
+        return 1; // no owner/repo (useHttpPath not set?) — decline
+    };
+
+    let url = format!("{}/git-credential?repo={}", base, repo);
+    let client = reqwest::blocking::Client::new();
+    let Ok(resp) = client
+        .get(&url)
+        .header("X-Ghpool-Key", key)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+    else {
+        return 1;
+    };
+    if !resp.status().is_success() {
+        return 1;
+    }
+    let Ok(v) = resp.json::<serde_json::Value>() else {
+        return 1;
+    };
+    let (Some(user), Some(pass)) = (v["username"].as_str(), v["password"].as_str()) else {
+        return 1;
+    };
+    println!("username={}", user);
+    println!("password={}", pass);
+    0
+}
+
+/// Parse `key=value` lines of the git credential helper protocol.
+fn parse_credential_input(input: &str) -> std::collections::HashMap<String, String> {
+    input
+        .lines()
+        .take_while(|l| !l.is_empty())
+        .filter_map(|l| {
+            l.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// `owner/repo` from a git request path: strips a trailing `.git` and any
+/// extra segments (`owner/repo/info/refs` → `owner/repo`).
+fn repo_from_path(path: &str) -> Option<String> {
+    let mut parts = path.trim_start_matches('/').splitn(3, '/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    if repo.is_empty() {
+        return None;
+    }
+    Some(format!("{}/{}", owner, repo))
+}
+
 fn flag_val(args: &[String], flag: &str) -> Option<String> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
 }
@@ -353,5 +450,35 @@ mod tests {
 
         let a = args(&["api", "graphql"]);
         assert_eq!(try_api(&a, "http://fake:8080"), None);
+    }
+}
+
+#[cfg(test)]
+mod git_credential_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_credential_input() {
+        let attrs = parse_credential_input(
+            "protocol=https\nhost=github.com\npath=openabdev/openab.git\n\nignored=after-blank\n",
+        );
+        assert_eq!(attrs.get("protocol").unwrap(), "https");
+        assert_eq!(attrs.get("host").unwrap(), "github.com");
+        assert_eq!(attrs.get("path").unwrap(), "openabdev/openab.git");
+        assert!(!attrs.contains_key("ignored"), "parsing stops at blank line");
+    }
+
+    #[test]
+    fn test_repo_from_path() {
+        assert_eq!(repo_from_path("openabdev/openab.git").as_deref(), Some("openabdev/openab"));
+        assert_eq!(repo_from_path("openabdev/openab").as_deref(), Some("openabdev/openab"));
+        assert_eq!(repo_from_path("/oablab/chi.git").as_deref(), Some("oablab/chi"));
+        assert_eq!(
+            repo_from_path("openabdev/openab/info/refs").as_deref(),
+            Some("openabdev/openab")
+        );
+        assert_eq!(repo_from_path("justowner"), None);
+        assert_eq!(repo_from_path("owner/.git"), None);
+        assert_eq!(repo_from_path(""), None);
     }
 }

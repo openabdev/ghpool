@@ -47,6 +47,14 @@ enabled = false
 # PATs, and are always fail-closed audited. When set, the default upstream
 # switches to the full write-capable surface.
 # enable_writes = false
+# Enable GET /git-credential: repository-scoped agents exchange their
+# X-Ghpool-Key for a short-lived, SINGLE-REPO GitHub App installation token
+# usable as a git-over-HTTPS credential (username `x-access-token`). Closes
+# the long-lived-PAT gap for `git push`. Same hard gate as writes: agents +
+# App backend + audit (every issuance fail-closed audited). The App needs
+# Contents: read/write for pushes. Client side: `ghp git-credential` is a
+# drop-in git credential helper (see README).
+# enable_git_credentials = false
 # Max concurrent write calls per agent (0 = unlimited).
 # max_inflight_writes = 4
 # Upstream MCP endpoint. Default: hosted read-only variant, or the full

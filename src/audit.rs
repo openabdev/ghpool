@@ -98,6 +98,27 @@ impl AuditSink {
         }))
     }
 
+    /// Git credential issuance record (one per issued token). An Err here
+    /// MUST reject the issuance (fail-closed) — an unaudited credential is
+    /// worse than a failed push.
+    pub fn record_git_credential(
+        &self,
+        agent: &str,
+        credential: &str,
+        repo: &str,
+        expires_at: u64,
+    ) -> Result<(), String> {
+        self.append(serde_json::json!({
+            "ts": unix_now_ms(),
+            "phase": "git_credential",
+            "agent": agent,
+            "cred": credential,
+            "repo": repo,
+            "expires_at": expires_at,
+            "decision": "allow",
+        }))
+    }
+
     /// Append one JSONL record and fsync. Small blocking write on the async
     /// path — acceptable: write calls are rare and records are <1 KB.
     fn append(&self, record: serde_json::Value) -> Result<(), String> {

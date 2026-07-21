@@ -1245,7 +1245,7 @@ impl Drop for InFlightGuard {
 /// - No [[mcp.agents]] configured → Phase 1 network-trust mode: Ok(None).
 /// - Agents configured → every request must present a valid X-Ghpool-Key;
 ///   missing or unknown keys get 401 with a JSON-RPC error body.
-fn authenticate<'a>(
+pub(crate) fn authenticate<'a>(
     state: &'a AppState,
     headers: &HeaderMap,
 ) -> Result<Option<&'a crate::config::McpAgentConfig>, Box<Response>> {
@@ -1284,7 +1284,7 @@ fn audit_via(agent: Option<&crate::config::McpAgentConfig>, identity_id: &str) -
 
 /// Minimal JSON-RPC error body for proxy-level failures, so MCP clients that
 /// only speak JSON-RPC degrade gracefully.
-fn rpc_error(status: StatusCode, message: &str) -> Response {
+pub(crate) fn rpc_error(status: StatusCode, message: &str) -> Response {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": null,
@@ -1451,6 +1451,7 @@ mod tests {
                 mcp: config::McpConfig {
                     enabled: true,
                     enable_writes: false,
+                    enable_git_credentials: false,
                     upstream: Some(upstream.to_string()),
                     toolsets: toolsets.iter().map(|s| s.to_string()).collect(),
                     session_ttl_secs: 3600,
@@ -2333,6 +2334,7 @@ mod tests {
                 mcp: config::McpConfig {
                     enabled: true,
                     enable_writes: false,
+                    enable_git_credentials: false,
                     upstream: Some(upstream.to_string()),
                     toolsets: vec![],
                     session_ttl_secs: 3600,
@@ -2462,6 +2464,7 @@ mod tests {
                 mcp: config::McpConfig {
                     enabled: true,
                     enable_writes: false,
+                    enable_git_credentials: false,
                     upstream: Some(upstream.to_string()),
                     toolsets: vec![],
                     session_ttl_secs: 3600,
@@ -2652,6 +2655,7 @@ mod tests {
                 mcp: config::McpConfig {
                     enabled: true,
                     enable_writes: true,
+                    enable_git_credentials: false,
                     upstream: Some(upstream.to_string()),
                     toolsets: vec![],
                     session_ttl_secs: 3600,
@@ -2946,6 +2950,7 @@ mod tests {
                 mcp: config::McpConfig {
                     enabled: true,
                     enable_writes,
+                    enable_git_credentials: false,
                     upstream: Some(upstream.to_string()),
                     toolsets: vec![],
                     session_ttl_secs: 3600,

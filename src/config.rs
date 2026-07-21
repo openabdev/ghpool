@@ -70,6 +70,14 @@ pub struct McpConfig {
     /// [mcp.audit] configured (writes are fail-closed audited).
     #[serde(default)]
     pub enable_writes: bool,
+    /// Enable the /git-credential endpoint: repository-scoped agents can
+    /// exchange their X-Ghpool-Key for a short-lived, single-repo GitHub App
+    /// installation token usable as a git-over-HTTPS credential
+    /// (username `x-access-token`). Hard requirements mirror enable_writes:
+    /// [[mcp.agents]], an App backend, and [mcp.audit] (every issuance is
+    /// fail-closed audited). The App needs Contents: read/write for pushes.
+    #[serde(default)]
+    pub enable_git_credentials: bool,
     /// Upstream MCP endpoint. Defaults to GitHub's hosted read-only variant,
     /// or the full write-capable surface when enable_writes is set.
     #[serde(default)]
@@ -185,6 +193,7 @@ impl Default for McpConfig {
         Self {
             enabled: false,
             enable_writes: false,
+            enable_git_credentials: false,
             upstream: None,
             toolsets: Vec::new(),
             session_ttl_secs: default_mcp_session_ttl(),
@@ -240,6 +249,20 @@ impl McpConfig {
                         ));
                     }
                 }
+            }
+        }
+        // Git credential issuance shares the write gate's hard requirements:
+        // authenticated agents, App-backed tokens (never PATs), and a
+        // fail-closed audit trail for every issuance.
+        if self.enable_git_credentials {
+            if self.agents.is_empty() {
+                return Err("enable_git_credentials requires [[mcp.agents]] — credentials are only issued to authenticated agents".into());
+            }
+            if self.github_app.is_none() && self.github_apps.is_empty() {
+                return Err("enable_git_credentials requires [mcp.github_app] or [[mcp.github_apps]] — git credentials are App installation tokens, never PATs".into());
+            }
+            if self.audit.is_none() {
+                return Err("enable_git_credentials requires [mcp.audit] — issuance is fail-closed audited".into());
             }
         }
         // Mutual exclusion: singular and plural forms cannot coexist
@@ -676,6 +699,7 @@ mod tests {
         wa.tools = vec!["issue_read".into(), "create_issue".into()];
         let m = McpConfig {
             enable_writes: true,
+            enable_git_credentials: false,
             github_apps: vec![entry("openabdev")],
             agents: vec![wa],
             audit: Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 }),
@@ -725,6 +749,7 @@ mod tests {
         let m = McpConfig {
             enabled: true,
             enable_writes: true,
+            enable_git_credentials: false,
             github_apps: vec![entry("openabdev"), entry("oablab")],
             agents: vec![multi_agent(&["openabdev/openab", "oablab/chi"])],
             audit: Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 }),

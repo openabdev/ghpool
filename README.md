@@ -459,6 +459,51 @@ Trade-off vs. one key per org: a leaked key reaches the allowlisted repos of
 **all** configured installations. Prefer separate agents/keys when you want
 per-org blast-radius isolation.
 
+#### Git over HTTPS via App tokens (`/git-credential`)
+
+MCP covers issues and PRs, but `git push` speaks the Git protocol — it needs
+a real credential at push time. `enable_git_credentials` lets a
+repository-scoped agent exchange its ghpool key for a **short-lived,
+single-repo** App installation token, eliminating the last long-lived GitHub
+credential in the agent container:
+
+```toml
+[mcp]
+enable_git_credentials = true   # same hard gate as writes:
+                                # agents + App backend + [mcp.audit]
+```
+
+The App needs **Contents: Read & write** on the target repositories.
+
+Agent side, `ghp` doubles as a standard git credential helper:
+
+```sh
+git config --global credential."https://github.com".helper "!ghp git-credential"
+git config --global credential."https://github.com".useHttpPath true
+```
+
+Every `git push` then flows:
+
+```
+git push → ghp git-credential (GHPOOL_KEY from env)
+         → GET /git-credential?repo=owner/name   (X-Ghpool-Key)
+         → key auth → repo allowlist → installation routing
+         → fail-closed audit record (phase: git_credential)
+         → single-repo installation token (~1h, GitHub-enforced scope)
+         → push authenticated as <app>[bot]
+```
+
+Properties:
+
+- **Single-repo tokens** — each credential is minted with exactly the repo
+  being pushed; GitHub itself enforces the boundary.
+- **Fail-closed audit** — no audit record, no credential (503). The token
+  value is never written to the audit log.
+- **Deny-by-default** — repo-less agents, off-allowlist repos, and owners
+  without an installation are refused before any mint.
+- **Nothing to store** — `store`/`erase` are no-ops; tokens expire on their
+  own. `cache-control: no-store` on the response.
+
 Deployment notes:
 
 - Requires egress to `api.githubcopilot.com` (the only additional external dependency).
