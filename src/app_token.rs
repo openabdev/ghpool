@@ -28,6 +28,11 @@ const REFRESH_MARGIN: Duration = Duration::from_secs(300);
 /// binding must not live for the whole process lifetime.
 const VERIFY_TTL: Duration = Duration::from_secs(3600);
 
+/// Hard ceiling on any single GitHub App API call (JWT-authenticated mint,
+/// installation resolution/verification). Without it a stalled connection
+/// would hold a singleflight waiter queue indefinitely.
+const MINT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A minted installation token plus its expiry (unix seconds).
 #[derive(Clone, Debug)]
 pub struct AppToken {
@@ -47,10 +52,12 @@ pub struct AppTokenProvider {
     /// intentionally isolated: a repo-scoped MCP token may carry broader App
     /// permissions and must never satisfy a git credential request.
     cached: Mutex<HashMap<String, AppToken>>,
-    /// Serializes mints so concurrent cache misses for the same key don't
-    /// each mint a token (waste + audit noise). Held across the mint await;
-    /// contention is negligible at this call rate.
-    mint_lock: tokio::sync::Mutex<()>,
+    /// Per-key singleflight locks: concurrent misses for the SAME cache key
+    /// wait for one mint; distinct keys (different repos or purposes) mint
+    /// in parallel so one slow mint cannot stall unrelated issuance. The
+    /// map is bounded by the distinct (purpose, envelope) combinations in
+    /// use.
+    mint_locks: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     /// Owner verified from GitHub's installation API for an explicit ID,
     /// with the verification time — re-checked after VERIFY_TTL. The
     /// configured owner label is not trusted by itself.
@@ -95,9 +102,12 @@ impl AppTokenProvider {
             installation_id: Mutex::new(installation_id),
             owner,
             api_base,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(MINT_TIMEOUT)
+                .build()
+                .map_err(|e| format!("http client build failed: {}", e))?,
             cached: Mutex::new(HashMap::new()),
-            mint_lock: tokio::sync::Mutex::new(()),
+            mint_locks: Mutex::new(HashMap::new()),
             verified_owner: Mutex::new(None),
         })
     }
@@ -146,9 +156,17 @@ impl AppTokenProvider {
                 return Ok(t.clone());
             }
         }
-        // Singleflight: concurrent misses for the same key wait here, then
-        // re-check the cache so only the first caller actually mints.
-        let _mint_guard = self.mint_lock.lock().await;
+        // Key-scoped singleflight: concurrent misses for the SAME key wait
+        // for one mint and then re-check the cache; distinct keys proceed in
+        // parallel so a slow mint never stalls unrelated issuance.
+        let key_lock = self
+            .mint_locks
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _mint_guard = key_lock.lock().await;
         if let Some(t) = self.cached.lock().unwrap().get(&key) {
             if t.expires_at > unix_now() + REFRESH_MARGIN.as_secs() {
                 return Ok(t.clone());
@@ -657,5 +675,62 @@ pub(crate) mod tests {
             1,
             "singleflight: concurrent misses must mint exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn test_distinct_keys_mint_in_parallel() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        // The "slowrepo" mint stalls; "fastrepo" answers immediately. A
+        // slow mint for one key must not delay issuance for another key.
+        async fn mint(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            let repos = body["repositories"].as_array().cloned().unwrap_or_default();
+            if repos.iter().any(|r| r == "slowrepo") {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let exp = time::OffsetDateTime::from_unix_timestamp((unix_now() + 3600) as i64)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            Json(serde_json::json!({
+                "token": format!("ghs_{}", repos[0].as_str().unwrap()),
+                "expires_at": exp,
+            }))
+        }
+        let app = Router::new().route("/app/installations/8/access_tokens", post(mint));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let p = Arc::new(
+            AppTokenProvider::new(
+                "123".into(),
+                TEST_RSA_PEM,
+                Some(8),
+                None,
+                format!("http://{}", addr),
+            )
+            .unwrap(),
+        );
+        let start = Instant::now();
+        let slow = {
+            let p = p.clone();
+            tokio::spawn(async move { p.token_git("slowrepo").await })
+        };
+        // give the slow mint a head start so its lock is held
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let fast = p.token_git("fastrepo").await.unwrap();
+        let fast_elapsed = start.elapsed();
+        assert_eq!(fast.token, "ghs_fastrepo");
+        assert!(
+            fast_elapsed < std::time::Duration::from_millis(400),
+            "distinct key must not wait behind a slow mint (took {:?})",
+            fast_elapsed
+        );
+        let slow = slow.await.unwrap().unwrap();
+        assert_eq!(slow.token, "ghs_slowrepo");
+        assert!(start.elapsed() >= std::time::Duration::from_millis(500));
     }
 }
