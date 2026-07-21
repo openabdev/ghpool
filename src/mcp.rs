@@ -660,6 +660,21 @@ async fn pick_credential(
                     state.mcp_sessions.invalidate(sid).await;
                 }
                 PinnedCred::MultiApp { routes, primary } => {
+                    // Routes are minted together — the session dies as a
+                    // WHOLE at the earliest expiry (documented behavior),
+                    // regardless of which route this call would select.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if routes.values().any(|r| r.expires_at <= now) {
+                        tracing::info!(
+                            "MCP session terminated: a pinned App token expired{}",
+                            session_suffix(Some(sid))
+                        );
+                        state.mcp_sessions.invalidate(sid).await;
+                        return Err(StatusCode::NOT_FOUND);
+                    }
                     let key = route_owner
                         .map(|o| o.to_lowercase())
                         .unwrap_or_else(|| primary.clone());
@@ -674,21 +689,6 @@ async fn pick_credential(
                         );
                         return Err(StatusCode::FORBIDDEN);
                     };
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    if route.expires_at <= now {
-                        // Sessions cannot outlive their credentials; routes
-                        // are minted together, so terminate the whole
-                        // session and let the client re-initialize.
-                        tracing::info!(
-                            "MCP session terminated: pinned App token expired for owner {}{}",
-                            key, session_suffix(Some(sid))
-                        );
-                        state.mcp_sessions.invalidate(sid).await;
-                        return Err(StatusCode::NOT_FOUND);
-                    }
                     return Ok(McpCredential::Routed {
                         owner: key,
                         token: route.token.clone(),
@@ -908,9 +908,43 @@ async fn multi_initialize(
         if *owner == primary_owner {
             primary_resp = Some(resp);
         } else {
-            // Secondary responses are consumed internally; only the session
-            // ID matters. Initialize bodies are small.
-            let _ = resp.bytes().await;
+            // Secondary responses are consumed internally — and HTTP 2xx is
+            // not sufficient: a JSON-RPC error inside a 200 means this
+            // installation has no usable session. Fail the whole initialize
+            // (fail-closed), because the client only ever sees the primary
+            // response and would otherwise believe every route is healthy.
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            match buffer_body(resp, MAX_BODY_BYTES).await {
+                Ok(BufferedBody::Complete(bytes)) => {
+                    if crate::audit::parse_tool_outcome(content_type.as_deref(), &bytes)
+                        == Some(true)
+                    {
+                        tracing::error!(
+                            "mcp upstream initialize for owner {} returned a JSON-RPC error",
+                            owner
+                        );
+                        return rpc_error(StatusCode::BAD_GATEWAY, "upstream initialize failed");
+                    }
+                }
+                Ok(BufferedBody::Overflow(_, _)) => {
+                    tracing::error!(
+                        "mcp upstream initialize for owner {} exceeded the buffer cap",
+                        owner
+                    );
+                    return rpc_error(StatusCode::BAD_GATEWAY, "upstream initialize failed");
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "mcp upstream initialize read failed for owner {}: {}",
+                        owner, e
+                    );
+                    return rpc_error(StatusCode::BAD_GATEWAY, "upstream request failed");
+                }
+            }
         }
     }
 
@@ -2682,6 +2716,20 @@ mod tests {
             session: session.clone(),
             body: body_str.clone(),
         });
+        if body_str.contains("fail_secondary")
+            && auth.as_deref() == Some("Bearer ghs_openabdev")
+        {
+            // JSON-RPC error INSIDE an HTTP 200 — a session id is present
+            // but the initialization failed at the protocol level.
+            return Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .header("mcp-session-id", "sess-ghs_openabdev")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32603,"message":"boom"}}"#,
+                ))
+                .unwrap();
+        }
         if body_str.contains("\"initialize\"") {
             let token = auth
                 .as_deref()
@@ -2964,7 +3012,9 @@ mod tests {
 
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"openab","issue_number":1}}}"#,
+                // Call the LIVE route (oablab): routes are minted together,
+                // so ANY expired route terminates the session as a whole.
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"oablab","repo":"chi","issue_number":1}}}"#,
                 &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "dsid")],
             ))
             .await
@@ -2973,6 +3023,25 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert!(state.mcp_sessions.get("dsid").await.is_none());
         assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_multi_initialize_fails_closed_on_secondary_jsonrpc_error() {
+        let (url, captured) = spawn_mock_upstream_multi().await;
+        let state = test_state_multi(&url, false, None).await;
+        // The mock returns a JSON-RPC error (inside HTTP 200) for the
+        // openabdev (secondary) installation when the frame is tagged.
+        let resp = mcp_app(state.clone())
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"tag":"fail_secondary"}}"#,
+                &[("x-ghpool-key", "key-b0")],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // Both upstreams were attempted, but no session was pinned
+        assert_eq!(captured.lock().unwrap().len(), 2);
+        assert!(state.mcp_sessions.get("sess-ghs_oablab").await.is_none());
     }
 
     #[tokio::test]

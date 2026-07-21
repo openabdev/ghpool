@@ -258,8 +258,21 @@ impl McpConfig {
                     ));
                 }
                 for repo_entry in &agent.repos {
+                    // Strict form: `owner/name` or `owner/*` — no empty or
+                    // whitespace-padded parts, no extra path segments.
+                    // Sloppy entries would silently widen token scope
+                    // (installation-wide mint) or fail only at runtime.
                     let owner = match repo_entry.split_once('/') {
-                        Some((owner, _)) if !owner.trim().is_empty() => owner,
+                        Some((owner, name))
+                            if !owner.is_empty()
+                                && owner == owner.trim()
+                                && (name == "*"
+                                    || (!name.is_empty()
+                                        && name == name.trim()
+                                        && !name.contains('/'))) =>
+                        {
+                            owner
+                        }
                         _ => {
                             return Err(format!(
                                 "mcp agent '{}' repo entry '{}' is malformed — expected owner/repo or owner/*",
@@ -267,7 +280,7 @@ impl McpConfig {
                             ));
                         }
                     };
-                    let normalized = owner.trim().to_lowercase();
+                    let normalized = owner.to_lowercase();
                     if !seen_owners.contains(&normalized) {
                         return Err(format!(
                             "mcp agent '{}' authorizes repo owner '{}' but no [[mcp.github_apps]] entry covers it — agents cannot authorize a repo owner without a matching installation",
@@ -659,6 +672,28 @@ mod tests {
             ..Default::default()
         };
         assert!(m.validate().unwrap_err().contains("malformed"));
+
+        // sloppy entries that would widen scope or fail at runtime: rejected
+        for bad in ["openabdev/", "openabdev/repo/extra", "openabdev / repo", "openabdev/ repo", "/repo"] {
+            let m = McpConfig {
+                github_apps: vec![entry("openabdev")],
+                agents: vec![multi_agent(&[bad])],
+                ..Default::default()
+            };
+            assert!(
+                m.validate().unwrap_err().contains("malformed"),
+                "entry '{}' must be rejected",
+                bad
+            );
+        }
+
+        // wildcard form accepted
+        let m = McpConfig {
+            github_apps: vec![entry("openabdev")],
+            agents: vec![multi_agent(&["openabdev/*"])],
+            ..Default::default()
+        };
+        assert!(m.validate().is_ok());
 
         // valid multi config satisfies the write gate too
         let m = McpConfig {

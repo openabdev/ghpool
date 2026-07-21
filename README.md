@@ -439,6 +439,11 @@ tools/call {owner: "oablab", …}    → session B (oablab token)
 - **Primary route** — the alphabetically first owner in the agent's `repos`
   allowlist. Its upstream session ID doubles as the downstream session ID
   and serves non-repo traffic (`tools/list`, GET streams).
+- **Primary-only server-initiated traffic** — GET stream resumption and any
+  client→server JSON-RPC responses ride the primary route's upstream
+  session. GitHub's hosted MCP server answers `tools/call` directly in the
+  POST response, so tool calls are unaffected; server-initiated
+  interactions on secondary routes are not supported.
 - **Grant identical App permissions to every installation** — `tools/list`
   is served by the primary installation, so a permission mismatch would
   advertise tools that fail with a permission error on the other org.
