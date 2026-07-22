@@ -84,6 +84,7 @@ Request Flow:
 - Caches GitHub REST and GraphQL query responses in memory with configurable TTLs
 - Proxies GraphQL mutations with passthrough auth (client's own token, no caching)
 - **MCP reverse proxy** (opt-in) — agents connect an MCP client to `/mcp` and get GitHub's official MCP tools with **no GitHub credential on the agent**; per-agent keys + default-deny tool/repo allowlists, GitHub App credentials, and hard-gated audited writes
+- **Git credential broker** (opt-in) — `obk` acts as a git credential helper: at `git push` time it exchanges the agent's octobroker key for a short-lived, single-repo, Contents-only GitHub App token — no stored git credential in the agent container
 - Mirrors the GitHub API path structure — clients just change the base URL
 - Restricts access to configured org/owner repos only
 - Auto-resolves GitHub username from tokens for audit logging
@@ -310,7 +311,7 @@ Behavior notes:
 - **Sessions are pinned** — the pooled identity is selected at `initialize` and reused for the whole MCP session. An unknown or expired session gets `404` (per MCP spec) and the client re-initializes transparently.
 - **Tool names differ from the write server** — the readonly surface uses e.g. `issue_read`, not `get_issue`. Discover them via `tools/list`.
 - **Audit log** — every JSON-RPC frame is logged with method, tool name, identity, and session: `MCP tools/call issue_read [via alice] [session=7b86a7eb]`.
-- **`allowed_owners` is not enforced on `/mcp`** in Phase 1 — access is bounded by the pooled credential's own permissions and the read-only upstream. Per-agent repo allowlists arrive in Phase 2.
+- **`allowed_owners` is not enforced on `/mcp`** — without `[[mcp.agents]]` configured, access is bounded only by the pooled credential's own permissions and the read-only upstream. For repo-level control, configure per-agent `repos` allowlists (below).
 
 #### Per-agent authentication (Phase 2a)
 
@@ -616,28 +617,31 @@ Kiro CLI (`~/.kiro/settings/mcp.json`) and most JSON-configured clients:
 {
   "mcpServers": {
     "github": {
-      "url": "http://octobroker.<namespace>:8080/mcp"
+      "url": "http://octobroker.<namespace>:8080/mcp",
+      "headers": { "X-Octobroker-Key": "${OCTOBROKER_KEY}" }
     }
   }
 }
 ```
 
+With `[[mcp.agents]]` configured (recommended), every request needs the agent's `X-Octobroker-Key` — deliver it via ECS task secrets / K8s Secrets. Without any agents configured (network-trust mode), the `headers` line can be dropped.
+
 Claude Code:
 
 ```sh
-claude mcp add --transport http github http://octobroker.<namespace>:8080/mcp
+claude mcp add --transport http github http://octobroker.<namespace>:8080/mcp \
+  --header "X-Octobroker-Key: ${OCTOBROKER_KEY}"
 ```
 
-Verify from the container (no `Authorization` header anywhere):
+Verify from the container (no GitHub credential anywhere):
 
 ```sh
 curl -s -X POST http://octobroker:8080/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
+  -H "X-Octobroker-Key: $OCTOBROKER_KEY" \
   -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' -i | grep -i mcp-session-id
 ```
-
-In Phase 2, agents will additionally present an octobroker API key (`X-Octobroker-Key` header from an env-injected secret) mapped to a per-agent tool/repo allowlist — see [#17](https://github.com/openabdev/octobroker/issues/17).
 
 ### Direct curl
 
