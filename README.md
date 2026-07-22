@@ -1,4 +1,6 @@
-# octobroker
+<p align="center">
+  <img src="docs/assets/logo.png" alt="octobroker — Secure GitHub Gateway for AI Agents" width="360">
+</p>
 
 A secure, cloud-native GitHub gateway for AI coding agents. Agents get GitHub's official MCP tools, REST/GraphQL reads, and even `git push` — **without holding a single GitHub credential**. octobroker authenticates each agent with a revocable key, enforces per-agent default-deny tool and repo policy, and mints short-lived, repo-scoped GitHub App tokens on demand — across multiple orgs from one endpoint. PAT pooling and read caching included for high-throughput REST traffic.
 
