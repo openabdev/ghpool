@@ -1,7 +1,7 @@
-# ghpool Design
+# octobroker Design
 
-> Living distillation of [RFC #15](https://github.com/openabdev/ghpool/issues/15)
-> (Revision 2) and the [Phase 0 spike findings](https://github.com/openabdev/ghpool/issues/22),
+> Living distillation of [RFC #15](https://github.com/openabdev/octobroker/issues/15)
+> (Revision 2) and the [Phase 0 spike findings](https://github.com/openabdev/octobroker/issues/22),
 > as actually shipped. For onboarding, see [getting-started.md](getting-started.md).
 
 ## Problem
@@ -15,19 +15,19 @@ GitHub credential inside the agent's environment:
 | Token vending machine | Agent still holds a live token for its lifetime; misusable within scope |
 | Per-agent fine-grained PATs | Management burden; still long-lived; single-org |
 
-ghpool's position: **the agent never holds any GitHub credential.** It holds
-at most a ghpool API key — revocable centrally, bounded by policy, useless
+octobroker's position: **the agent never holds any GitHub credential.** It holds
+at most an octobroker API key — revocable centrally, bounded by policy, useless
 against GitHub directly.
 
 ## Architecture
 
-ghpool is a **credential-swapping reverse proxy with a default-deny policy
+octobroker is a **credential-swapping reverse proxy with a default-deny policy
 engine**, sitting between agents and two GitHub surfaces:
 
 - **MCP** (`/mcp`) -> GitHub's hosted MCP server (`api.githubcopilot.com/mcp/`), with a
-  narrowly scoped ghpool-owned review-tool exception. Upstream schemas remain
-  proxied verbatim; `ghpool_*` tools are explicit, default-deny, App-backed,
-  repository-bound, and fail-closed audited. ghpool does not expose arbitrary
+  narrowly scoped octobroker-owned review-tool exception. Upstream schemas remain
+  proxied verbatim; `octobroker_*` tools are explicit, default-deny, App-backed,
+  repository-bound, and fail-closed audited. octobroker does not expose arbitrary
   GraphQL or a general custom-tool registry.
 - **REST/GraphQL** (`/{path}`, `/graphql`) → `api.github.com`, with PAT
   pooling (budget-aware selection) and in-memory read caching. GraphQL
@@ -36,7 +36,7 @@ engine**, sitting between agents and two GitHub surfaces:
 ### Request path (MCP)
 
 ```
-agent → [authn: X-Ghpool-Key] → [session binding] → [tool allowlist]
+agent → [authn: X-Octobroker-Key] → [session binding] → [tool allowlist]
       → [write classification] → [repo allowlist (deny-if-unresolvable)]
       → [in-flight cap] → [fail-closed audit] → forward with scoped token
       → [buffer+parse write outcomes] → audit result
@@ -51,11 +51,11 @@ remains for REST reads and legacy setups). Decided in Phase 0 after the
 PAT-pooling compliance concern (GitHub ToS §H rate-limit aggregation) was
 raised in review:
 
-- Minted by ghpool from the App private key (RS256 JWT → installation
+- Minted by octobroker from the App private key (RS256 JWT → installation
   token), cached, auto-refreshed 5 minutes before the 1-hour expiry.
 - **Scoped at mint**: an agent whose repo allowlist is exact entries under
   one owner gets tokens minted with the API's `repositories` parameter —
-  GitHub itself enforces the repo boundary, independent of ghpool's
+  GitHub itself enforces the repo boundary, independent of octobroker's
   argument parsing (which remains as defense-in-depth). One credential per
   policy envelope.
 - **Writes never run on PATs** — enforced by startup validation, not
@@ -72,7 +72,7 @@ Sessions (`Mcp-Session-Id`) are pinned to `(credential, agent)` at
   403 (binding violation).
 - A session cannot outlive its credential: expired App-token pins terminate
   the session. Provider refreshes don't disturb in-flight sessions.
-- **ghpool's pin cache is the sole session authority.** Phase 0 measured the
+- **octobroker's pin cache is the sole session authority.** Phase 0 measured the
   hosted endpoint's own session semantics as fail-open: upstream DELETE is a
   no-op (the session remains usable), and unknown sessions get 400 not 404.
   Nothing about session validity is delegated upstream.
@@ -117,7 +117,7 @@ before the call is forwarded; if it cannot be persisted, the write is
 rejected (503) without side effects. The result record captures the **MCP
 tool outcome** — `result.isError` arrives inside HTTP 200/SSE, so transport
 status alone is never treated as success. Argument values are never logged
-(key names + resolved repo only). ghpool never auto-retries a forwarded
+(key names + resolved repo only). octobroker never auto-retries a forwarded
 call; ambiguous outcomes are recorded as undeterminable and surfaced to the
 caller.
 
@@ -128,7 +128,7 @@ caller.
 - **No rate-limit headers on the hosted MCP endpoint** (Phase 0 finding) —
   budget accounting stays REST-driven; per-agent quotas are Phase 3.
 - **GitHub-side write attribution is the App identity**, not the individual
-  agent. The ghpool audit log is the per-agent ledger; GraphQL mutation
+  agent. The octobroker audit log is the per-agent ledger; GraphQL mutation
   passthrough remains the right path when GitHub-side per-human attribution
   matters.
 - **Contract-drift risk**: the hosted MCP surface (tool names, headers like
@@ -145,9 +145,9 @@ caller.
 | Proxy official schemas, define no tools | RFC Rev 1 | Zero schema maintenance; GitHub owns the surface |
 | GitHub App primary, PAT pool legacy | RFC Rev 2 / #22 | ToS compliance, short-lived creds, scoped mint |
 | `X-MCP-Tools` not `X-MCP-Toolsets` | #22 finding F | Toolsets fail open on invalid names |
-| ghpool is session authority | #22 finding I | Upstream DELETE is a no-op |
+| octobroker is session authority | #22 finding I | Upstream DELETE is a no-op |
 | 404 on unknown session, never rotate identity | #20 review | MCP spec; no silent actor switching |
 | Buffer + parse write responses | #17 review | `isError` inside HTTP 200; audit must record tool outcome |
 | Scoped installation tokens per policy envelope | #17 review | GitHub enforces the repo boundary, not just our parser |
 | Writes: App + audit + agents required in code | #17 review | Hard rules, not documented hopes |
-| `ghpool_*` review tools as a narrow MCP exception | #44 / PR #45 | Fill upstream capability gaps without arbitrary GraphQL; preserve default-deny, repo binding, App credentials, and audit |
+| `octobroker_*` review tools as a narrow MCP exception | #44 / PR #45 | Fill upstream capability gaps without arbitrary GraphQL; preserve default-deny, repo binding, App credentials, and audit |

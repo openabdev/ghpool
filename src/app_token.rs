@@ -231,7 +231,7 @@ impl AppTokenProvider {
             .post(&url)
             .header("Authorization", format!("Bearer {}", jwt))
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")));
+            .header("User-Agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")));
         if !body.is_empty() {
             req = req.json(&body);
         }
@@ -289,7 +289,7 @@ impl AppTokenProvider {
             .get(&url)
             .header("Authorization", format!("Bearer {}", jwt))
             .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
+            .header("User-Agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
             .send()
             .await
             .map_err(|e| format!("installation owner verification failed: {}", e))?;
@@ -333,7 +333,7 @@ impl AppTokenProvider {
                 .get(&path)
                 .header("Authorization", format!("Bearer {}", jwt))
                 .header("Accept", "application/vnd.github+json")
-                .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
+                .header("User-Agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
                 .send()
                 .await
                 .map_err(|e| format!("installation discovery failed: {}", e))?;
@@ -541,14 +541,14 @@ pub(crate) mod tests {
         assert_eq!(MINTS.load(Ordering::SeqCst), 2);
 
         // Scoped envelopes are cached independently of installation-wide
-        let s1 = p.token_scoped(&["ghpool".into()]).await.unwrap();
+        let s1 = p.token_scoped(&["octobroker".into()]).await.unwrap();
         assert_eq!(s1.token, "ghs_mock_3");
         // same envelope (different order) hits the cache
-        let s2 = p.token_scoped(&["ghpool".into()]).await.unwrap();
+        let s2 = p.token_scoped(&["octobroker".into()]).await.unwrap();
         assert_eq!(s2.token, "ghs_mock_3");
         assert_eq!(MINTS.load(Ordering::SeqCst), 3);
         // different envelope mints separately
-        let s3 = p.token_scoped(&["ghpool".into(), "openab".into()]).await.unwrap();
+        let s3 = p.token_scoped(&["octobroker".into(), "openab".into()]).await.unwrap();
         assert_eq!(s3.token, "ghs_mock_4");
         assert_eq!(MINTS.load(Ordering::SeqCst), 4);
     }

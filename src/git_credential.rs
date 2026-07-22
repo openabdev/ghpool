@@ -1,13 +1,13 @@
 //! Git-over-HTTPS credential issuance (`/git-credential`).
 //!
-//! Repository-scoped agents exchange their `X-Ghpool-Key` for a short-lived
+//! Repository-scoped agents exchange their `X-Octobroker-Key` for a short-lived
 //! GitHub App installation token scoped to EXACTLY ONE repository, usable as
 //! a git HTTPS credential (`x-access-token:<token>`). This closes the last
 //! long-lived-credential gap for agents: pushes authenticate as the App
 //! (`<app>[bot]`), expire within the hour, and every issuance is fail-closed
 //! audited.
 //!
-//! Request:  GET /git-credential?repo=<owner>/<name>   (X-Ghpool-Key header)
+//! Request:  GET /git-credential?repo=<owner>/<name>   (X-Octobroker-Key header)
 //! Response: {"username":"x-access-token","password":"…","expires_at":…}
 //!
 //! Policy stack (all fail-closed):
@@ -375,14 +375,14 @@ mod tests {
             .method("GET")
             .uri(format!("/git-credential?repo={}", repo));
         if let Some(k) = key {
-            b = b.header("x-ghpool-key", k);
+            b = b.header("x-octobroker-key", k);
         }
         b.body(Body::empty()).unwrap()
     }
 
     fn audit_tmp(name: &str) -> String {
         std::env::temp_dir()
-            .join(format!("ghpool-gitcred-{}-{}.jsonl", name, std::process::id()))
+            .join(format!("octobroker-gitcred-{}-{}.jsonl", name, std::process::id()))
             .to_str()
             .unwrap()
             .to_string()

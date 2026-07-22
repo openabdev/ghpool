@@ -6,7 +6,7 @@ allowed_owners = ["openclaw", "openabdev"]
 #   "ghp_xxx"                                    — plain literal
 #   "env:GITHUB_TOKEN"                           — from environment variable
 #   "aws:secretsmanager:my-secret:github_pat"    — from AWS Secrets Manager (JSON key)
-#   "k8s:default/ghpool-secrets:pat"             — from K8s secret mounted at /etc/secrets/
+#   "k8s:default/octobroker-secrets:pat"             — from K8s secret mounted at /etc/secrets/
 
 [[identities]]
 id = "local"
@@ -14,11 +14,11 @@ token = "env:GITHUB_TOKEN"
 
 # [[identities]]
 # id = "prod"
-# token = "aws:secretsmanager:ghpool/pats:pat_prod"
+# token = "aws:secretsmanager:octobroker/pats:pat_prod"
 
 # [[identities]]
 # id = "k8s"
-# token = "k8s:default/ghpool-secrets:pat"
+# token = "k8s:default/octobroker-secrets:pat"
 
 [cache]
 max_entries = 10000
@@ -34,11 +34,11 @@ default_ttl_secs = 60
 raw_ttl_secs = 30
 raw_max_bytes = 268435456  # 256 MiB — total byte budget, enforced via weigher
 
-# MCP reverse proxy (Phase 1: read-only) — https://github.com/openabdev/ghpool/issues/15
-# When enabled, ghpool proxies MCP Streamable HTTP traffic on /mcp to GitHub's
+# MCP reverse proxy (Phase 1: read-only) — https://github.com/openabdev/octobroker/issues/15
+# When enabled, octobroker proxies MCP Streamable HTTP traffic on /mcp to GitHub's
 # hosted MCP server, injecting a pooled credential upstream. Agents connect
 # with zero GitHub tokens:
-#   { "url": "http://ghpool:8080/mcp" }
+#   { "url": "http://octobroker:8080/mcp" }
 [mcp]
 enabled = false
 # Enable WRITE tools for authenticated agents (Phase 2b-5). Startup fails
@@ -48,7 +48,7 @@ enabled = false
 # switches to the full write-capable surface.
 # enable_writes = false
 # Enable GET /git-credential: repository-scoped agents exchange their
-# X-Ghpool-Key for a short-lived GitHub App installation token scoped to
+# X-Octobroker-Key for a short-lived GitHub App installation token scoped to
 # EXACTLY ONE repository with Contents-only permissions, usable as a
 # git-over-HTTPS credential (username `x-access-token`). Closes the
 # long-lived-PAT gap for `git push`. Same hard gate as writes: agents +
@@ -56,7 +56,7 @@ enabled = false
 # token is returned). The App needs Contents: read/write for pushes. With
 # the singular [mcp.github_app] form, `owner` is REQUIRED — the explicit
 # installation_id is verified against the installation's actual account
-# before issuance. Client side: `ghp git-credential` is a drop-in git
+# before issuance. Client side: `obk git-credential` is a drop-in git
 # credential helper (see README for the fail-closed helper setup).
 # enable_git_credentials = false
 # Max concurrent write calls per agent (0 = unlimited).
@@ -77,7 +77,7 @@ enabled = false
 # record captures the MCP tool outcome (result.isError) — HTTP 200 alone is
 # not a success signal. Argument VALUES are never recorded (key names only).
 # [mcp.audit]
-# path = "/var/lib/ghpool/mcp-audit.jsonl"
+# path = "/var/lib/octobroker/mcp-audit.jsonl"
 # max_result_bytes = 4194304  # response buffer cap for outcome extraction
 
 # GitHub App credential backend (Phase 2b) — RECOMMENDED for production MCP.
@@ -88,7 +88,7 @@ enabled = false
 # The PAT pool remains for REST/GraphQL and as the MCP fallback.
 # [mcp.github_app]
 # app_id = "123456"
-# private_key = "aws:secretsmanager:ghpool/app:private_key"  # env:/k8s: also work
+# private_key = "aws:secretsmanager:octobroker/app:private_key"  # env:/k8s: also work
 # owner = "openabdev"          # installation discovered from org/user…
 # # installation_id = 87654321 # …or set explicitly
 
@@ -97,26 +97,26 @@ enabled = false
 # installation, keyed by its owner. tools/call frames route to the
 # installation matching the repository owner resolved from the CALL
 # ARGUMENTS — never from anything the agent chooses directly. At
-# `initialize`, ghpool eagerly mints one repo-scoped token and opens one
+# `initialize`, octobroker eagerly mints one repo-scoped token and opens one
 # upstream MCP session per owner in the agent's repo allowlist (fail-closed:
 # any failure fails the whole initialize); the client sees a single session.
 # Requires [[mcp.agents]] with non-empty exact `repos` — every repo owner
 # must be covered by an entry here (validated at startup).
 # [[mcp.github_apps]]
 # app_id = "123456"            # the same App installed in both orgs, or…
-# private_key = "aws:secretsmanager:ghpool/app:private_key"
+# private_key = "aws:secretsmanager:octobroker/app:private_key"
 # owner = "openabdev"          # routing key (unique across entries)
 # # installation_id = 87654321 # recommended: skip discovery
 #
 # [[mcp.github_apps]]
 # app_id = "654321"            # …a separate App per org
-# private_key = "aws:secretsmanager:ghpool/app-oablab:private_key"
+# private_key = "aws:secretsmanager:octobroker/app-oablab:private_key"
 # owner = "oablab"
 # # installation_id = 12345678
 
 # Per-agent authentication + default-deny tool allowlists (Phase 2a).
 # When any [[mcp.agents]] entry exists, EVERY /mcp request must present a
-# valid X-Ghpool-Key header. tools/call for a tool not on the agent's
+# valid X-Octobroker-Key header. tools/call for a tool not on the agent's
 # allowlist is rejected at the proxy (403); the allowlist is also injected
 # upstream as X-MCP-Tools. No entries = Phase 1 network-trust mode.
 #
@@ -127,16 +127,16 @@ enabled = false
 # presented by a different agent is rejected (403).
 # [[mcp.agents]]
 # id = "openab-bot"
-# key = "aws:secretsmanager:ghpool/mcp-keys:openab"   # or env:GHPOOL_KEY_OPENAB
-# # keys = ["env:GHPOOL_KEY_OPENAB", "env:GHPOOL_KEY_OPENAB_NEXT"]  # rotation
+# key = "aws:secretsmanager:octobroker/mcp-keys:openab"   # or env:OCTOBROKER_KEY_OPENAB
+# # keys = ["env:OCTOBROKER_KEY_OPENAB", "env:OCTOBROKER_KEY_OPENAB_NEXT"]  # rotation
 # tools = ["issue_read", "list_issues", "pull_request_read"]
 # # Repository allowlist: "owner/repo" exact or "owner/*" wildcard.
 # # Non-empty = every tools/call must resolve to a listed repo from its
 # # arguments; calls with no repo target (e.g. search_code, get_me) are
 # # DENIED. Empty/omitted = no repository restriction.
-# repos = ["openabdev/ghpool", "oablab/*"]
+# repos = ["openabdev/octobroker", "oablab/*"]
 #
 # [[mcp.agents]]
 # id = "ci-agent"
-# key = "env:GHPOOL_KEY_CI"
+# key = "env:OCTOBROKER_KEY_CI"
 # tools = ["get_file_contents", "list_commits"]

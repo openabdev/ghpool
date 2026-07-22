@@ -1,4 +1,4 @@
-//! End-to-end tests of the `ghp git-credential` helper contract against the
+//! End-to-end tests of the `obk git-credential` helper contract against the
 //! real binary: a recognized github.com request must emit `quit=true` (exit
 //! 0) on every failure — never fall through to another credential helper —
 //! while non-GitHub hosts decline quietly (exit 1, no output).
@@ -6,28 +6,28 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-/// Run `ghp git-credential get` with the given stdin and optional
-/// GHPOOL_KEY. GHPOOL_URL points at a closed port so any fetch attempt
+/// Run `obk git-credential get` with the given stdin and optional
+/// OCTOBROKER_KEY. OCTOBROKER_URL points at a closed port so any fetch attempt
 /// fails without touching the network.
 fn run_get(input: &str, key: Option<&str>) -> (String, i32) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ghp"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_obk"));
     cmd.args(["git-credential", "get"])
-        .env_remove("GHPOOL_KEY")
-        .env("GHPOOL_URL", "http://127.0.0.1:1")
+        .env_remove("OCTOBROKER_KEY")
+        .env("OCTOBROKER_URL", "http://127.0.0.1:1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     if let Some(k) = key {
-        cmd.env("GHPOOL_KEY", k);
+        cmd.env("OCTOBROKER_KEY", k);
     }
-    let mut child = cmd.spawn().expect("spawn ghp");
+    let mut child = cmd.spawn().expect("spawn obk");
     child
         .stdin
         .as_mut()
         .unwrap()
         .write_all(input.as_bytes())
         .unwrap();
-    let out = child.wait_with_output().expect("wait ghp");
+    let out = child.wait_with_output().expect("wait obk");
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         out.status.code().expect("exit code"),
@@ -73,10 +73,10 @@ fn non_github_host_declines_quietly() {
 #[test]
 fn store_and_erase_are_noops() {
     for op in ["store", "erase"] {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ghp"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_obk"));
         let out = cmd
             .args(["git-credential", op])
-            .env_remove("GHPOOL_KEY")
+            .env_remove("OCTOBROKER_KEY")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

@@ -43,7 +43,7 @@ struct AppState {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("ghpool=info".parse().unwrap()))
+        .with_env_filter(EnvFilter::from_default_env().add_directive("octobroker=info".parse().unwrap()))
         .with_timer(tracing_subscriber::fmt::time::LocalTime::new(
             time::format_description::parse("[year]-[month]-[day]T[hour]:[minute]:[second]").unwrap(),
         ))
@@ -129,7 +129,7 @@ async fn main() {
     let app = app.with_state(state);
 
     let addr = format!("0.0.0.0:{}", config.port);
-    tracing::info!("ghpool listening on {}", addr);
+    tracing::info!("octobroker listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
@@ -196,7 +196,7 @@ async fn proxy(
     // Forward request
     let mut req = state.http.get(&url)
         .header("Authorization", format!("Bearer {}", identity.token))
-        .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
+        .header("User-Agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
         .header("Accept", "application/vnd.github+json");
 
     if let Some(version) = headers.get("x-github-api-version") {
@@ -278,7 +278,7 @@ async fn proxy_raw(
     let result = state.cache.get_or_insert_raw(&cache_key, async move {
         let resp = state_for_fetch.http.get(&url)
             .header("Authorization", format!("Bearer {}", token))
-            .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
+            .header("User-Agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
             .header("Accept", &accept)
             .send()
             .await
@@ -372,7 +372,7 @@ async fn graphql_proxy(
 
     let resp = state.http.post("https://api.github.com/graphql")
         .header("Authorization", &auth_header)
-        .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
+        .header("User-Agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
         .header("Content-Type", "application/json")
         .body(body.to_vec())
         .send()
@@ -420,7 +420,7 @@ async fn resolve_token_user(state: &AppState, auth_header: &str) -> String {
     }
     let user = match state.http.get("https://api.github.com/user")
         .header("Authorization", auth_header)
-        .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
+        .header("User-Agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
         .send()
         .await
     {
@@ -520,7 +520,7 @@ mod tests {
     #[test]
     fn test_is_allowed_path() {
         let owners = vec!["openabdev".to_string(), "oablab".to_string()];
-        assert!(is_allowed_path("/repos/openabdev/ghpool/pulls/1", &owners));
+        assert!(is_allowed_path("/repos/openabdev/octobroker/pulls/1", &owners));
         assert!(is_allowed_path("/repos/oablab/chi/issues", &owners));
         assert!(!is_allowed_path("/repos/evil/repo/pulls/1", &owners));
         // Non-repo paths are allowed
