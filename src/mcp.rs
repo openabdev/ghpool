@@ -55,7 +55,13 @@ const FWD_HEADERS: &[&str] = &[
 /// octobroker-owned MCP tools are namespaced so they cannot collide with tools
 /// exposed by GitHub's hosted MCP server.
 const MINIMIZE_COMMENT_TOOL: &str = "octobroker_review_minimize_comment";
+const COMMIT_STATUS_TOOL: &str = "octobroker_commit_status_set";
+/// Every octobroker-owned local tool. Any new entry must preserve the explicit
+/// per-agent allowlist, repository binding, write gate, and fail-closed audit
+/// requirements (see issue #44).
+const LOCAL_TOOLS: &[&str] = &[MINIMIZE_COMMENT_TOOL, COMMIT_STATUS_TOOL];
 const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
+const GITHUB_API_URL: &str = "https://api.github.com";
 const MINIMIZE_CLASSIFIERS: &[&str] = &[
     "ABUSE",
     "DUPLICATE",
@@ -64,6 +70,12 @@ const MINIMIZE_CLASSIFIERS: &[&str] = &[
     "RESOLVED",
     "SPAM",
 ];
+/// States accepted by GitHub's REST commit status API.
+const COMMIT_STATUS_STATES: &[&str] = &["error", "failure", "pending", "success"];
+
+fn is_local_tool(name: &str) -> bool {
+    LOCAL_TOOLS.contains(&name)
+}
 
 pub async fn mcp_proxy(
     State(state): State<Arc<AppState>>,
@@ -184,17 +196,21 @@ pub async fn mcp_proxy(
     // Local octobroker-owned tools are writes even when the upstream policy block
     // is bypassed (for example, in no-agent/network-trust mode). Keep the
     // local mutation path fail-closed and before credential resolution.
-    if frame.as_ref().and_then(|f| f.tool.as_deref()) == Some(MINIMIZE_COMMENT_TOOL)
-        && (agent.is_none() || !state.config.mcp.enable_writes)
+    if let Some(local) = frame
+        .as_ref()
+        .and_then(|f| f.tool.as_deref())
+        .filter(|t| is_local_tool(t))
     {
-        tracing::warn!(
-            "MCP tools/call {} DENIED (local write tools require an authenticated write-enabled agent)",
-            MINIMIZE_COMMENT_TOOL
-        );
-        return rpc_error(
-            StatusCode::FORBIDDEN,
-            "local write tools require an authenticated write-enabled agent",
-        );
+        if agent.is_none() || !state.config.mcp.enable_writes {
+            tracing::warn!(
+                "MCP tools/call {} DENIED (local write tools require an authenticated write-enabled agent)",
+                local
+            );
+            return rpc_error(
+                StatusCode::FORBIDDEN,
+                "local write tools require an authenticated write-enabled agent",
+            );
+        }
     }
 
     // Multi-installation mode: `initialize` fans out to one upstream session
@@ -335,8 +351,20 @@ pub async fn mcp_proxy(
     // octobroker-owned review tools are handled locally. All policy and audit
     // checks above still apply; the upstream GitHub MCP server is not asked
     // to interpret a tool it does not expose.
-    if frame.as_ref().and_then(|f| f.tool.as_deref()) == Some(MINIMIZE_COMMENT_TOOL) {
-        let local = handle_minimize_comment(&state, &cred, frame.as_ref().unwrap(), GITHUB_GRAPHQL_URL).await;
+    if let Some(local_tool) = frame
+        .as_ref()
+        .and_then(|f| f.tool.as_deref())
+        .filter(|t| is_local_tool(t))
+        .map(str::to_string)
+    {
+        let local = match local_tool.as_str() {
+            MINIMIZE_COMMENT_TOOL => {
+                handle_minimize_comment(&state, &cred, frame.as_ref().unwrap(), GITHUB_GRAPHQL_URL).await
+            }
+            _ => {
+                handle_commit_status_set(&state, &cred, frame.as_ref().unwrap(), GITHUB_API_URL).await
+            }
+        };
         if let (Some(tool_name), Some(sink)) = (&write_call, &state.audit) {
             let call = crate::audit::CallInfo {
                 rpc_id: frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
@@ -492,7 +520,7 @@ pub async fn mcp_proxy(
     // response remains untouched for all other agents and requests.
     if frame.as_ref().map(|f| f.method.as_str()) == Some("tools/list")
         && state.config.mcp.enable_writes
-        && custom_tool_enabled(agent, MINIMIZE_COMMENT_TOOL)
+        && LOCAL_TOOLS.iter().any(|tool| custom_tool_enabled(agent, tool))
     {
         let content_type = resp
             .headers()
@@ -501,7 +529,7 @@ pub async fn mcp_proxy(
             .map(str::to_string);
         match buffer_body(resp, MAX_BODY_BYTES).await {
             Ok(BufferedBody::Complete(bytes)) => {
-                let body = inject_custom_tool(
+                let body = inject_custom_tools(
                     &bytes,
                     content_type.as_deref(),
                     agent.map(|a| a.tools.as_slice()),
@@ -644,24 +672,47 @@ fn custom_tool_enabled(
         .unwrap_or(false)
 }
 
-fn custom_tool_definition() -> serde_json::Value {
-    serde_json::json!({
-        "name": MINIMIZE_COMMENT_TOOL,
-        "description": "Minimize a GitHub issue or pull request comment by GraphQL node ID.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "owner": { "type": "string", "description": "Repository owner." },
-                "repo": { "type": "string", "description": "Repository name." },
-                "node_id": { "type": "string", "description": "Global GraphQL node ID of the comment." },
-                "classifier": {
-                    "type": "string",
-                    "enum": MINIMIZE_CLASSIFIERS
-                }
-            },
-            "required": ["owner", "repo", "node_id", "classifier"]
-        }
-    })
+fn local_tool_definition(name: &str) -> serde_json::Value {
+    match name {
+        MINIMIZE_COMMENT_TOOL => serde_json::json!({
+            "name": MINIMIZE_COMMENT_TOOL,
+            "description": "Minimize a GitHub issue or pull request comment by GraphQL node ID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string", "description": "Repository owner." },
+                    "repo": { "type": "string", "description": "Repository name." },
+                    "node_id": { "type": "string", "description": "Global GraphQL node ID of the comment." },
+                    "classifier": {
+                        "type": "string",
+                        "enum": MINIMIZE_CLASSIFIERS
+                    }
+                },
+                "required": ["owner", "repo", "node_id", "classifier"]
+            }
+        }),
+        COMMIT_STATUS_TOOL => serde_json::json!({
+            "name": COMMIT_STATUS_TOOL,
+            "description": "Create a commit status (state + context) on a commit SHA via GitHub's REST statuses API.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string", "description": "Repository owner." },
+                    "repo": { "type": "string", "description": "Repository name." },
+                    "sha": { "type": "string", "description": "Full commit SHA the status attaches to." },
+                    "state": {
+                        "type": "string",
+                        "enum": COMMIT_STATUS_STATES
+                    },
+                    "context": { "type": "string", "description": "Status check label, e.g. \"OpenAB PR Review\"." },
+                    "description": { "type": "string", "description": "Short description (at most 140 characters)." },
+                    "target_url": { "type": "string", "description": "http(s) URL with details, e.g. a review comment permalink." }
+                },
+                "required": ["owner", "repo", "sha", "state", "context"]
+            }
+        }),
+        other => unreachable!("unknown local tool: {}", other),
+    }
 }
 
 /// Parse one JSON response from either a JSON body or an SSE event. SSE
@@ -694,11 +745,14 @@ fn parse_sse_or_json(body: &[u8], content_type: Option<&str>) -> Option<serde_js
     serde_json::from_str(last_event?.as_str()).ok()
 }
 
-/// Append a custom tool to a JSON or SSE-framed tools/list response and filter
-/// upstream tools against the authenticated agent's complete allowlist. A
-/// parse failure returns None so the caller can forward the upstream response
-/// unchanged rather than breaking an otherwise compatible MCP session.
-fn inject_custom_tool(
+/// Append the agent's allowlisted octobroker-owned tools to a JSON or
+/// SSE-framed tools/list response and filter upstream tools against the
+/// authenticated agent's complete allowlist. A parse failure returns None so
+/// the caller can forward the upstream response unchanged rather than
+/// breaking an otherwise compatible MCP session. `allowed_tools = None`
+/// (network-trust mode never reaches here in production) injects every local
+/// tool.
+fn inject_custom_tools(
     body: &[u8],
     content_type: Option<&str>,
     allowed_tools: Option<&[String]>,
@@ -716,12 +770,17 @@ fn inject_custom_tool(
                 .unwrap_or(false)
         });
     }
-    if !tools.iter().any(|tool| {
-        tool.get("name")
-            .and_then(|name| name.as_str())
-            == Some(MINIMIZE_COMMENT_TOOL)
-    }) {
-        tools.push(custom_tool_definition());
+    for local in LOCAL_TOOLS {
+        let enabled = allowed_tools
+            .map(|allowed| allowed.iter().any(|candidate| candidate == local))
+            .unwrap_or(true);
+        if enabled
+            && !tools.iter().any(|tool| {
+                tool.get("name").and_then(|name| name.as_str()) == Some(*local)
+            })
+        {
+            tools.push(local_tool_definition(local));
+        }
     }
     let encoded = serde_json::to_string(&json).ok()?;
     if is_sse {
@@ -908,6 +967,164 @@ async fn handle_minimize_comment(
             false,
             StatusCode::OK,
             format!("Comment minimized as {}", classifier),
+        ),
+        http_status: status.as_u16(),
+        tool_error: Some(false),
+    }
+}
+
+/// GitHub owner and repository names are limited to alphanumerics, hyphen,
+/// underscore, and dot. The values become URL path segments, so anything
+/// else is rejected — a crafted argument must not be able to escape the
+/// policy-checked repository path.
+fn valid_repo_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Full commit SHA (40-hex today; 64-hex accepted for SHA-256 repos).
+fn valid_commit_sha(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// octobroker-owned tool: create a commit status via GitHub's REST API
+/// (`POST /repos/{owner}/{repo}/statuses/{sha}`). The repository target is
+/// taken from the same `owner`/`repo` arguments the proxy's policy layer
+/// already checked against the agent's allowlist, and re-validated here as
+/// URL path segments. Success is exactly HTTP 201 with an echoed state —
+/// anything else fails closed.
+async fn handle_commit_status_set(
+    state: &AppState,
+    cred: &McpCredential,
+    frame: &Frame,
+    api_base: &str,
+) -> LocalToolResponse {
+    let Some(arguments) = frame.arguments.as_ref().and_then(|value| value.as_object()) else {
+        return local_tool_error(frame.rpc_id.as_ref(), StatusCode::OK, "arguments must be an object");
+    };
+    for key in ["owner", "repo", "sha", "state", "context"] {
+        if arguments.get(key).and_then(|value| value.as_str()).is_none() {
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::OK,
+                format!("missing or invalid argument: {}", key),
+            );
+        }
+    }
+    let owner = arguments["owner"].as_str().unwrap();
+    let repo = arguments["repo"].as_str().unwrap();
+    let sha = arguments["sha"].as_str().unwrap();
+    let status_state = arguments["state"].as_str().unwrap();
+    let context = arguments["context"].as_str().unwrap();
+
+    if !valid_repo_segment(owner) || !valid_repo_segment(repo) {
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::OK,
+            "owner or repo contains unsupported characters",
+        );
+    }
+    if !valid_commit_sha(sha) {
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::OK,
+            "sha must be a full 40-hex (or 64-hex) commit SHA",
+        );
+    }
+    if !COMMIT_STATUS_STATES.contains(&status_state) {
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::OK,
+            "state must be one of: error, failure, pending, success",
+        );
+    }
+    if context.trim().is_empty() {
+        return local_tool_error(frame.rpc_id.as_ref(), StatusCode::OK, "context must not be empty");
+    }
+
+    let mut payload = serde_json::json!({ "state": status_state, "context": context });
+    if let Some(value) = arguments.get("description") {
+        let Some(description) = value.as_str() else {
+            return local_tool_error(frame.rpc_id.as_ref(), StatusCode::OK, "description must be a string");
+        };
+        if description.chars().count() > 140 {
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::OK,
+                "description must be at most 140 characters",
+            );
+        }
+        payload["description"] = serde_json::json!(description);
+    }
+    if let Some(value) = arguments.get("target_url") {
+        let Some(target_url) = value.as_str() else {
+            return local_tool_error(frame.rpc_id.as_ref(), StatusCode::OK, "target_url must be a string");
+        };
+        if !(target_url.starts_with("https://") || target_url.starts_with("http://")) {
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::OK,
+                "target_url must be an http(s) URL",
+            );
+        }
+        payload["target_url"] = serde_json::json!(target_url);
+    }
+
+    let url = format!(
+        "{}/repos/{}/{}/statuses/{}",
+        api_base.trim_end_matches('/'),
+        owner,
+        repo,
+        sha
+    );
+    let response = match state
+        .http
+        .post(&url)
+        .bearer_auth(cred.token())
+        .header("user-agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
+        .header("accept", "application/vnd.github+json")
+        .header("x-github-api-version", "2022-11-28")
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!("custom commit_status request failed for {}/{}: {}", owner, repo, error);
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::BAD_GATEWAY,
+                "GitHub commit status request failed",
+            );
+        }
+    };
+    let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    let created = status == StatusCode::CREATED
+        && body.get("state").and_then(|value| value.as_str()) == Some(status_state);
+    if !created {
+        tracing::warn!(
+            "GitHub commit status create failed for {}/{} (HTTP {})",
+            owner,
+            repo,
+            status
+        );
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            status,
+            "GitHub rejected commit status creation",
+        );
+    }
+
+    LocalToolResponse {
+        response: tool_response(
+            frame.rpc_id.as_ref(),
+            false,
+            StatusCode::OK,
+            format!("Commit status '{}' set to {} on {}", context, status_state, sha),
         ),
         http_status: status.as_u16(),
         tool_error: Some(false),
@@ -1716,7 +1933,7 @@ fn build_upstream_headers(
                 .tools
                 .iter()
                 .map(String::as_str)
-                .filter(|tool| *tool != MINIMIZE_COMMENT_TOOL)
+                .filter(|tool| !is_local_tool(tool))
                 .collect();
             if !upstream_tools.is_empty() {
                 if let Ok(v) = upstream_tools.join(",").parse() {
@@ -1862,28 +2079,45 @@ mod tests {
 
     #[test]
     fn test_custom_tool_definition_is_namespaced_and_write_shaped() {
-        let definition = custom_tool_definition();
-        assert_eq!(definition["name"], MINIMIZE_COMMENT_TOOL);
+        for name in LOCAL_TOOLS {
+            let definition = local_tool_definition(name);
+            assert_eq!(definition["name"], *name);
+            assert!(name.starts_with("octobroker_"), "{} must be namespaced", name);
+            assert_eq!(
+                crate::policy::classify_tool(name),
+                crate::policy::ToolKind::Write,
+                "{} must classify as a write",
+                name
+            );
+        }
         assert!(MINIMIZE_CLASSIFIERS.contains(&"OUTDATED"));
-        assert_eq!(crate::policy::classify_tool(MINIMIZE_COMMENT_TOOL), crate::policy::ToolKind::Write);
+        assert!(COMMIT_STATUS_STATES.contains(&"failure"));
     }
 
     #[test]
-    fn test_inject_custom_tool_json_response() {
+    fn test_inject_custom_tools_json_response() {
         let body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
-        let injected = inject_custom_tool(body, Some("application/json"), None).unwrap();
+        let injected = inject_custom_tools(body, Some("application/json"), None).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&injected).unwrap();
-        assert_eq!(json["result"]["tools"][0]["name"], MINIMIZE_COMMENT_TOOL);
+        let names: Vec<&str> = json["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, vec![MINIMIZE_COMMENT_TOOL, COMMIT_STATUS_TOOL]);
     }
 
     #[test]
-    fn test_inject_custom_tool_sse_response() {
+    fn test_inject_custom_tools_sse_response() {
         let body = br#"event: message
 data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
 
 "#;
-        let injected = inject_custom_tool(body, Some("text/event-stream"), None).unwrap();
-        assert!(String::from_utf8(injected).unwrap().contains(MINIMIZE_COMMENT_TOOL));
+        let injected = inject_custom_tools(body, Some("text/event-stream"), None).unwrap();
+        let text = String::from_utf8(injected).unwrap();
+        assert!(text.contains(MINIMIZE_COMMENT_TOOL));
+        assert!(text.contains(COMMIT_STATUS_TOOL));
     }
 
     #[test]
@@ -1892,16 +2126,19 @@ data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
             r#"{{"jsonrpc":"2.0","id":1,"result":{{"tools":[{{"name":"{}"}}]}}}}"#,
             MINIMIZE_COMMENT_TOOL
         );
-        let injected = inject_custom_tool(body.as_bytes(), Some("application/json"), None).unwrap();
+        let allowed = vec![MINIMIZE_COMMENT_TOOL.to_string()];
+        let injected =
+            inject_custom_tools(body.as_bytes(), Some("application/json"), Some(&allowed)).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(json["result"]["tools"].as_array().unwrap().len(), 1);
     }
 
     #[test]
-    fn test_inject_custom_tool_filters_to_allowlist() {
+    fn test_inject_custom_tools_filters_to_allowlist() {
+        // commit-status tool is NOT allowlisted — it must not be advertised.
         let body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"issue_read"},{"name":"create_issue"}]}}"#;
         let allowed = vec![MINIMIZE_COMMENT_TOOL.to_string(), "issue_read".to_string()];
-        let injected = inject_custom_tool(body, Some("application/json"), Some(&allowed)).unwrap();
+        let injected = inject_custom_tools(body, Some("application/json"), Some(&allowed)).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         let names: Vec<&str> = json["result"]["tools"]
             .as_array()
@@ -1910,6 +2147,21 @@ data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
             .filter_map(|tool| tool["name"].as_str())
             .collect();
         assert_eq!(names, vec!["issue_read", MINIMIZE_COMMENT_TOOL]);
+    }
+
+    #[test]
+    fn test_inject_custom_tools_each_requires_own_allowlist_entry() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+        let allowed = vec![COMMIT_STATUS_TOOL.to_string()];
+        let injected = inject_custom_tools(body, Some("application/json"), Some(&allowed)).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+        let names: Vec<&str> = json["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, vec![COMMIT_STATUS_TOOL]);
     }
 
     #[test]
@@ -1924,7 +2176,11 @@ data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
     #[test]
     fn test_header_filter_preserves_upstream_tools() {
         let client = HeaderMap::new();
-        let allowed = agent("review", "key", &[MINIMIZE_COMMENT_TOOL, "issue_read"]);
+        let allowed = agent(
+            "review",
+            "key",
+            &[MINIMIZE_COMMENT_TOOL, COMMIT_STATUS_TOOL, "issue_read"],
+        );
         let headers = build_upstream_headers(&client, "token", &[], Some(&allowed)).unwrap();
         assert_eq!(headers.get("x-mcp-tools").unwrap(), "issue_read");
     }
@@ -2887,6 +3143,162 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"octobroker_review_minimize_comment","arguments":{"owner":"openabdev","repo":"octobroker","node_id":"MDU6SXNzdWUx","classifier":"OUTDATED"}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(captured.lock().unwrap().len(), 0);
+    }
+
+    // ---- octobroker-owned tool: commit status (mock REST) ----
+
+    type StatusesLog = Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+
+    /// Mock api.github.com statuses endpoint: records (path, JSON body) and
+    /// answers with the configured HTTP status and response body.
+    async fn spawn_mock_statuses(
+        reply_status: u16,
+        reply_body: serde_json::Value,
+    ) -> (String, StatusesLog) {
+        let log: StatusesLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let handler = move |uri: axum::http::Uri, axum::Json(body): axum::Json<serde_json::Value>| {
+            let log = log2.clone();
+            let reply = reply_body.clone();
+            async move {
+                log.lock().unwrap().push((uri.path().to_string(), body));
+                (
+                    StatusCode::from_u16(reply_status).unwrap(),
+                    axum::Json(reply),
+                )
+            }
+        };
+        let app = axum::Router::new().fallback(handler);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{}", addr), log)
+    }
+
+    const TEST_SHA: &str = "f7c937837bfb02b248d86ef28ed4fd5dbd8d1a63";
+
+    fn commit_status_frame(arguments: serde_json::Value) -> Frame {
+        Frame {
+            method: "tools/call".to_string(),
+            rpc_id: Some(serde_json::json!(1)),
+            tool: Some(COMMIT_STATUS_TOOL.to_string()),
+            arguments: Some(arguments),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commit_status_success_posts_to_statuses_endpoint() {
+        let (api, log) = spawn_mock_statuses(
+            201,
+            serde_json::json!({"id": 1, "state": "failure", "context": "OpenAB PR Review"}),
+        )
+        .await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = commit_status_frame(serde_json::json!({
+            "owner": "openabdev",
+            "repo": "openab",
+            "sha": TEST_SHA,
+            "state": "failure",
+            "context": "OpenAB PR Review",
+            "description": "Changes Requested",
+            "target_url": "https://github.com/openabdev/openab/pull/1418#issuecomment-1",
+        }));
+        let out = handle_commit_status_set(&state, &app_cred(), &frame, &api).await;
+        assert_eq!(out.http_status, 201);
+        assert_eq!(out.tool_error, Some(false));
+        let recorded = log.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one status creation");
+        assert_eq!(
+            recorded[0].0,
+            format!("/repos/openabdev/openab/statuses/{}", TEST_SHA)
+        );
+        assert_eq!(recorded[0].1["state"], "failure");
+        assert_eq!(recorded[0].1["context"], "OpenAB PR Review");
+        assert_eq!(recorded[0].1["description"], "Changes Requested");
+        assert_eq!(
+            recorded[0].1["target_url"],
+            "https://github.com/openabdev/openab/pull/1418#issuecomment-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_status_rejects_bad_arguments_before_network() {
+        // Every rejection below uses an unroutable api_base: a network call
+        // would fail the test with BAD_GATEWAY instead of the arg error.
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let base = serde_json::json!({
+            "owner": "openabdev",
+            "repo": "openab",
+            "sha": TEST_SHA,
+            "state": "failure",
+            "context": "OpenAB PR Review",
+        });
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            ("state", serde_json::json!("broken")),          // not in enum
+            ("sha", serde_json::json!("f7c9378")),           // short sha
+            ("sha", serde_json::json!("../../evil")),        // path escape
+            ("owner", serde_json::json!("open/abdev")),      // path escape
+            ("repo", serde_json::json!("openab?x=1")),       // query injection
+            ("context", serde_json::json!("   ")),           // blank context
+            ("target_url", serde_json::json!("javascript:alert(1)")),
+            ("description", serde_json::json!("x".repeat(141))),
+        ];
+        for (key, value) in cases {
+            let mut args = base.clone();
+            args[key] = value;
+            let frame = commit_status_frame(args);
+            let out = handle_commit_status_set(&state, &app_cred(), &frame, "http://127.0.0.1:1").await;
+            assert_eq!(out.tool_error, Some(true), "case: {}", key);
+            assert_eq!(out.http_status, 200, "arg errors are tool errors, case: {}", key);
+        }
+        // Missing required argument
+        let frame = commit_status_frame(serde_json::json!({
+            "owner": "openabdev", "repo": "openab", "sha": TEST_SHA, "state": "failure"
+        }));
+        let out = handle_commit_status_set(&state, &app_cred(), &frame, "http://127.0.0.1:1").await;
+        assert_eq!(out.tool_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_commit_status_fails_closed_on_github_rejection() {
+        // 422 (e.g. missing Commit statuses permission or bad sha) → error.
+        let (api, _log) = spawn_mock_statuses(
+            422,
+            serde_json::json!({"message": "Validation Failed"}),
+        )
+        .await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = commit_status_frame(serde_json::json!({
+            "owner": "openabdev", "repo": "openab", "sha": TEST_SHA,
+            "state": "failure", "context": "OpenAB PR Review",
+        }));
+        let out = handle_commit_status_set(&state, &app_cred(), &frame, &api).await;
+        assert_eq!(out.http_status, 422);
+        assert_eq!(out.tool_error, Some(true));
+
+        // Non-201 success shapes also fail closed: only 201 Created counts.
+        let (api, _log) = spawn_mock_statuses(200, serde_json::json!({"state": "failure"})).await;
+        let out = handle_commit_status_set(&state, &app_cred(), &frame, &api).await;
+        assert_eq!(out.tool_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_phase1_mode_denies_local_commit_status_tool() {
+        // No agents → local write tools must not bypass the write gate.
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(&["alice"], &url, &[], vec![]);
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"{}","arguments":{{"owner":"openabdev","repo":"openab","sha":"{}","state":"failure","context":"OpenAB PR Review"}}}}}}"#,
+                    COMMIT_STATUS_TOOL, TEST_SHA
+                ),
                 &[],
             ))
             .await

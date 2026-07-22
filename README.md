@@ -382,6 +382,7 @@ Required GitHub App permissions (grant only what your agents' tools need):
 |-------|----------------|
 | `issue_read`, `list_issues`, `create_issue`, `add_issue_comment` | Issues: read / write |
 | `octobroker_review_minimize_comment` | Issues: write and Pull requests: write |
+| `octobroker_commit_status_set` | Commit statuses: write |
 | `pull_request_read`, `create_pull_request`, `merge_pull_request` | Pull requests: read / write |
 | `get_file_contents`, `create_or_update_file`, `push_files` | Contents: read / write |
 | `list_workflows`, `run_workflow` | Actions: read / write |
@@ -389,19 +390,21 @@ Required GitHub App permissions (grant only what your agents' tools need):
 
 #### octobroker-owned review tools (issue #44 MVP)
 
-When writes are enabled and an authenticated agent explicitly includes the tool in its allowlist, `tools/list` also advertises it. For example:
+When writes are enabled and an authenticated agent explicitly includes a tool in its allowlist, `tools/list` also advertises it. For example:
 
 ```toml
 [[mcp.agents]]
 id = "review-bot"
 key = "env:OCTOBROKER_REVIEW_KEY"
-tools = ["issue_read", "list_issues", "octobroker_review_minimize_comment"]
+tools = ["issue_read", "list_issues", "octobroker_review_minimize_comment", "octobroker_commit_status_set"]
 repos = ["openabdev/octobroker"]
 ```
 
-The tool accepts `owner`, `repo`, `node_id`, and a `classifier` (`ABUSE`, `DUPLICATE`, `OFF_TOPIC`, `OUTDATED`, `RESOLVED`, or `SPAM`). It supports issue and pull-request comments authored by the current GitHub App bot identity; it does not minimize human-authored comments or unsupported node types. Before mutating, it verifies both the App-bot author and the exact repository owner/name against the policy arguments, then executes GitHub's `minimizeComment` GraphQL mutation locally through octobroker's scoped GitHub App credential. The operation is not forwarded to the upstream MCP server. The call uses the same repository policy, write gate, in-flight limit, and fail-closed audit as upstream write tools. Agents that do not explicitly allowlist the name, or that have writes disabled, neither see it in `tools/list` nor can call it.
+`octobroker_review_minimize_comment` accepts `owner`, `repo`, `node_id`, and a `classifier` (`ABUSE`, `DUPLICATE`, `OFF_TOPIC`, `OUTDATED`, `RESOLVED`, or `SPAM`). It supports issue and pull-request comments authored by the current GitHub App bot identity; it does not minimize human-authored comments or unsupported node types. Before mutating, it verifies both the App-bot author and the exact repository owner/name against the policy arguments, then executes GitHub's `minimizeComment` GraphQL mutation locally through octobroker's scoped GitHub App credential. The operation is not forwarded to the upstream MCP server. The call uses the same repository policy, write gate, in-flight limit, and fail-closed audit as upstream write tools. Agents that do not explicitly allowlist the name, or that have writes disabled, neither see it in `tools/list` nor can call it.
 
-This is intentionally a narrow MVP: octobroker does not expose arbitrary GraphQL, and upstream GitHub MCP tools remain unchanged. Any future octobroker-owned tool must preserve the same explicit allowlist, repository binding, write gate, and audit requirements.
+`octobroker_commit_status_set` creates a [commit status](https://docs.github.com/en/rest/commits/statuses) — the upstream GitHub MCP server offers no commit-status mutation at all (only the read-only `get_status`), so review agents that need to publish a verdict as a status check (e.g. `context: "OpenAB PR Review"`, `state: failure`) use this broker-owned tool instead. It accepts `owner`, `repo`, a full commit `sha`, a `state` (`error`, `failure`, `pending`, or `success`), a non-empty `context`, and optional `description` (≤ 140 chars) and http(s) `target_url`. Arguments are strictly validated (the SHA and repository become URL path segments), then octobroker executes `POST /repos/{owner}/{repo}/statuses/{sha}` locally through the scoped GitHub App credential; only HTTP 201 counts as success. The same explicit allowlist, repository policy, write gate, in-flight limit, and fail-closed audit apply. Requires **Commit statuses: write** on the App.
+
+This is intentionally a narrow surface: octobroker does not expose arbitrary GraphQL or REST, and upstream GitHub MCP tools remain unchanged. Any future octobroker-owned tool must preserve the same explicit allowlist, repository binding, write gate, and audit requirements.
 
 The tool surface returned by `tools/list` shrinks to match the App's actual permissions (verified in the [#22 spike](https://github.com/openabdev/octobroker/issues/22)) — grant conservatively and expand as agents need more.
 
