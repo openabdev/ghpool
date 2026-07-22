@@ -361,7 +361,7 @@ path = "/var/lib/ghpool/mcp-audit.jsonl"
 [[mcp.agents]]                # writes are only for authenticated agents
 id = "openab-bot"
 key = "aws:secretsmanager:ghpool/mcp-keys:openab"
-tools = ["issue_read", "create_issue", "add_issue_comment"]
+tools = ["issue_read", "create_issue", "add_issue_comment", "ghpool_review_minimize_comment"]
 repos = ["openabdev/ghpool", "openabdev/openab"]
 ```
 
@@ -378,9 +378,27 @@ Required GitHub App permissions (grant only what your agents' tools need):
 | Tools | App permission |
 |-------|----------------|
 | `issue_read`, `list_issues`, `create_issue`, `add_issue_comment` | Issues: read / write |
+| `ghpool_review_minimize_comment` | Issues: write and Pull requests: write |
 | `pull_request_read`, `create_pull_request`, `merge_pull_request` | Pull requests: read / write |
 | `get_file_contents`, `create_or_update_file`, `push_files` | Contents: read / write |
 | `list_workflows`, `run_workflow` | Actions: read / write |
+
+
+#### ghpool-owned review tools (issue #44 MVP)
+
+When writes are enabled and an authenticated agent explicitly includes the tool in its allowlist, `tools/list` also advertises it. For example:
+
+```toml
+[[mcp.agents]]
+id = "review-bot"
+key = "env:GHPOOL_REVIEW_KEY"
+tools = ["issue_read", "list_issues", "ghpool_review_minimize_comment"]
+repos = ["openabdev/ghpool"]
+```
+
+The tool accepts `owner`, `repo`, `node_id`, and a `classifier` (`ABUSE`, `DUPLICATE`, `OFF_TOPIC`, `OUTDATED`, `RESOLVED`, or `SPAM`). It supports issue and pull-request comments authored by the current GitHub App bot identity; it does not minimize human-authored comments or unsupported node types. Before mutating, it verifies both the App-bot author and the exact repository owner/name against the policy arguments, then executes GitHub's `minimizeComment` GraphQL mutation locally through ghpool's scoped GitHub App credential. The operation is not forwarded to the upstream MCP server. The call uses the same repository policy, write gate, in-flight limit, and fail-closed audit as upstream write tools. Agents that do not explicitly allowlist the name, or that have writes disabled, neither see it in `tools/list` nor can call it.
+
+This is intentionally a narrow MVP: ghpool does not expose arbitrary GraphQL, and upstream GitHub MCP tools remain unchanged. Any future ghpool-owned tool must preserve the same explicit allowlist, repository binding, write gate, and audit requirements.
 
 The tool surface returned by `tools/list` shrinks to match the App's actual permissions (verified in the [#22 spike](https://github.com/openabdev/ghpool/issues/22)) — grant conservatively and expand as agents need more.
 

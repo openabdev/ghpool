@@ -52,6 +52,19 @@ const FWD_HEADERS: &[&str] = &[
     "last-event-id",
 ];
 
+/// ghpool-owned MCP tools are namespaced so they cannot collide with tools
+/// exposed by GitHub's hosted MCP server.
+const MINIMIZE_COMMENT_TOOL: &str = "ghpool_review_minimize_comment";
+const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
+const MINIMIZE_CLASSIFIERS: &[&str] = &[
+    "ABUSE",
+    "DUPLICATE",
+    "OFF_TOPIC",
+    "OUTDATED",
+    "RESOLVED",
+    "SPAM",
+];
+
 pub async fn mcp_proxy(
     State(state): State<Arc<AppState>>,
     method: Method,
@@ -166,6 +179,22 @@ pub async fn mcp_proxy(
                 }
             }
         }
+    }
+
+    // Local ghpool-owned tools are writes even when the upstream policy block
+    // is bypassed (for example, in no-agent/network-trust mode). Keep the
+    // local mutation path fail-closed and before credential resolution.
+    if frame.as_ref().and_then(|f| f.tool.as_deref()) == Some(MINIMIZE_COMMENT_TOOL)
+        && (agent.is_none() || !state.config.mcp.enable_writes)
+    {
+        tracing::warn!(
+            "MCP tools/call {} DENIED (local write tools require an authenticated write-enabled agent)",
+            MINIMIZE_COMMENT_TOOL
+        );
+        return rpc_error(
+            StatusCode::FORBIDDEN,
+            "local write tools require an authenticated write-enabled agent",
+        );
     }
 
     // Multi-installation mode: `initialize` fans out to one upstream session
@@ -303,6 +332,33 @@ pub async fn mcp_proxy(
         }
     }
 
+    // ghpool-owned review tools are handled locally. All policy and audit
+    // checks above still apply; the upstream GitHub MCP server is not asked
+    // to interpret a tool it does not expose.
+    if frame.as_ref().and_then(|f| f.tool.as_deref()) == Some(MINIMIZE_COMMENT_TOOL) {
+        let local = handle_minimize_comment(&state, &cred, frame.as_ref().unwrap(), GITHUB_GRAPHQL_URL).await;
+        if let (Some(tool_name), Some(sink)) = (&write_call, &state.audit) {
+            let call = crate::audit::CallInfo {
+                rpc_id: frame.as_ref().and_then(|f| f.rpc_id.as_ref()),
+                session: session_id.as_deref(),
+                agent: agent_id,
+                credential: &cred_label,
+                tool: tool_name,
+                repo: resolved_repo.as_ref(),
+            };
+            if let Err(e) = sink.record_result(
+                &call,
+                &crate::audit::CallOutcome {
+                    http_status: local.http_status,
+                    tool_error: local.tool_error,
+                },
+            ) {
+                tracing::error!("custom MCP tool result audit failed: {}", e);
+            }
+        }
+        return local.response;
+    }
+
     let upstream = state.config.mcp.upstream();
     // Timeouts are method-specific: POST responses (including SSE tool-call
     // results) complete within a bounded window, but GET is the stream
@@ -431,6 +487,45 @@ pub async fn mcp_proxy(
         }
     }
 
+    // Add ghpool-owned tools only to an authenticated agent's advertised
+    // surface when that agent explicitly allowlists the tool. The upstream
+    // response remains untouched for all other agents and requests.
+    if frame.as_ref().map(|f| f.method.as_str()) == Some("tools/list")
+        && state.config.mcp.enable_writes
+        && custom_tool_enabled(agent, MINIMIZE_COMMENT_TOOL)
+    {
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        match buffer_body(resp, MAX_BODY_BYTES).await {
+            Ok(BufferedBody::Complete(bytes)) => {
+                let body = inject_custom_tool(
+                    &bytes,
+                    content_type.as_deref(),
+                    agent.map(|a| a.tools.as_slice()),
+                )
+                .unwrap_or(bytes);
+                return builder
+                    .body(Body::from(body))
+                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+            }
+            Ok(BufferedBody::Overflow(head, rest)) => {
+                let head_stream = futures_util::stream::once(async move {
+                    Ok::<_, reqwest::Error>(Bytes::from(head))
+                });
+                return builder
+                    .body(Body::from_stream(head_stream.chain(rest)))
+                    .unwrap_or_else(|_| rpc_error(StatusCode::BAD_GATEWAY, "failed to build response"));
+            }
+            Err(e) => {
+                tracing::error!("tools/list response read failed: {}", e);
+                return rpc_error(StatusCode::BAD_GATEWAY, "upstream response failed");
+            }
+        }
+    }
+
     // Audited write call: buffer the response (bounded) to extract the MCP
     // tool outcome — a failed GitHub operation arrives as result.isError
     // inside an HTTP 200/SSE body, so HTTP status alone is not a success
@@ -532,6 +627,291 @@ async fn buffer_body(resp: reqwest::Response, cap: usize) -> Result<BufferedBody
         }
     }
     Ok(BufferedBody::Complete(buf))
+}
+
+struct LocalToolResponse {
+    response: Response,
+    http_status: u16,
+    tool_error: Option<bool>,
+}
+
+fn custom_tool_enabled(
+    agent: Option<&crate::config::McpAgentConfig>,
+    tool_name: &str,
+) -> bool {
+    agent
+        .map(|a| a.tools.iter().any(|tool| tool == tool_name))
+        .unwrap_or(false)
+}
+
+fn custom_tool_definition() -> serde_json::Value {
+    serde_json::json!({
+        "name": MINIMIZE_COMMENT_TOOL,
+        "description": "Minimize a GitHub issue or pull request comment by GraphQL node ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "owner": { "type": "string", "description": "Repository owner." },
+                "repo": { "type": "string", "description": "Repository name." },
+                "node_id": { "type": "string", "description": "Global GraphQL node ID of the comment." },
+                "classifier": {
+                    "type": "string",
+                    "enum": MINIMIZE_CLASSIFIERS
+                }
+            },
+            "required": ["owner", "repo", "node_id", "classifier"]
+        }
+    })
+}
+
+/// Parse one JSON response from either a JSON body or an SSE event. SSE
+/// permits multiple data lines per event; those lines are joined with a
+/// newline before JSON decoding, as required by the event-stream format.
+fn parse_sse_or_json(body: &[u8], content_type: Option<&str>) -> Option<serde_json::Value> {
+    let is_sse = content_type
+        .map(|value| value.starts_with("text/event-stream"))
+        .unwrap_or(false);
+    if !is_sse {
+        return serde_json::from_slice(body).ok();
+    }
+
+    let text = std::str::from_utf8(body).ok()?;
+    let mut current = String::new();
+    let mut last_event = None;
+    for line in text.lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            if !current.is_empty() {
+                current.push('\n');
+            }
+            current.push_str(data.strip_prefix(' ').unwrap_or(data));
+        } else if line.is_empty() && !current.is_empty() {
+            last_event = Some(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        last_event = Some(current);
+    }
+    serde_json::from_str(last_event?.as_str()).ok()
+}
+
+/// Append a custom tool to a JSON or SSE-framed tools/list response and filter
+/// upstream tools against the authenticated agent's complete allowlist. A
+/// parse failure returns None so the caller can forward the upstream response
+/// unchanged rather than breaking an otherwise compatible MCP session.
+fn inject_custom_tool(
+    body: &[u8],
+    content_type: Option<&str>,
+    allowed_tools: Option<&[String]>,
+) -> Option<Vec<u8>> {
+    let is_sse = content_type
+        .map(|value| value.starts_with("text/event-stream"))
+        .unwrap_or(false);
+    let mut json = parse_sse_or_json(body, content_type)?;
+    let tools = json.get_mut("result")?.get_mut("tools")?.as_array_mut()?;
+    if let Some(allowed) = allowed_tools {
+        tools.retain(|tool| {
+            tool.get("name")
+                .and_then(|name| name.as_str())
+                .map(|name| allowed.iter().any(|candidate| candidate == name))
+                .unwrap_or(false)
+        });
+    }
+    if !tools.iter().any(|tool| {
+        tool.get("name")
+            .and_then(|name| name.as_str())
+            == Some(MINIMIZE_COMMENT_TOOL)
+    }) {
+        tools.push(custom_tool_definition());
+    }
+    let encoded = serde_json::to_string(&json).ok()?;
+    if is_sse {
+        Some(format!("event: message\ndata: {}\n\n", encoded).into_bytes())
+    } else {
+        Some(encoded.into_bytes())
+    }
+}
+
+fn tool_response(
+    rpc_id: Option<&serde_json::Value>,
+    is_error: bool,
+    http_status: StatusCode,
+    text: impl Into<String>,
+) -> Response {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": rpc_id.cloned().unwrap_or(serde_json::Value::Null),
+        "result": {
+            "isError": is_error,
+            "content": [{"type": "text", "text": text.into()}]
+        }
+    });
+    Response::builder()
+        .status(http_status)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static MCP tool response")
+}
+
+fn local_tool_error(
+    rpc_id: Option<&serde_json::Value>,
+    http_status: StatusCode,
+    message: impl Into<String>,
+) -> LocalToolResponse {
+    LocalToolResponse {
+        response: tool_response(rpc_id, true, http_status, message),
+        http_status: http_status.as_u16(),
+        tool_error: Some(true),
+    }
+}
+
+async fn execute_graphql(
+    state: &AppState,
+    cred: &McpCredential,
+    graphql_url: &str,
+    payload: &serde_json::Value,
+) -> Result<(StatusCode, serde_json::Value), ()> {
+    let response = state
+        .http
+        .post(graphql_url)
+        .bearer_auth(cred.token())
+        .header("user-agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
+        .header("content-type", "application/json")
+        .json(payload)
+        .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS))
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::error!("custom MCP GraphQL request failed: {}", error);
+        })?;
+    let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = response.json().await.map_err(|error| {
+        tracing::error!("custom MCP GraphQL response parse failed: {}", error);
+    })?;
+    Ok((status, body))
+}
+
+/// GraphQL identity note: the viewer for an App installation token logs in
+/// as "<app-slug>[bot]", while Bot-authored comments carry the bare
+/// "<app-slug>" author login (empirically verified against api.github.com).
+/// Compare with the "[bot]" suffix normalized on both sides.
+fn normalize_actor(login: &str) -> &str {
+    login.strip_suffix("[bot]").unwrap_or(login)
+}
+
+async fn handle_minimize_comment(
+    state: &AppState,
+    cred: &McpCredential,
+    frame: &Frame,
+    graphql_url: &str,
+) -> LocalToolResponse {
+    let Some(arguments) = frame.arguments.as_ref().and_then(|value| value.as_object()) else {
+        return local_tool_error(frame.rpc_id.as_ref(), StatusCode::OK, "arguments must be an object");
+    };
+    for key in ["owner", "repo", "node_id", "classifier"] {
+        if arguments.get(key).and_then(|value| value.as_str()).is_none() {
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::OK,
+                format!("missing or invalid argument: {}", key),
+            );
+        }
+    }
+    let owner = arguments["owner"].as_str().unwrap();
+    let repo = arguments["repo"].as_str().unwrap();
+    let node_id = arguments["node_id"].as_str().unwrap();
+    let classifier = arguments["classifier"].as_str().unwrap();
+    if !MINIMIZE_CLASSIFIERS.contains(&classifier) {
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::OK,
+            "classifier is not supported",
+        );
+    }
+
+    let verify_payload = serde_json::json!({
+        "query": "query VerifyComment($id: ID!) { viewer { login } node(id: $id) { ... on IssueComment { author { login } issue { repository { nameWithOwner } } } ... on PullRequestReviewComment { author { login } pullRequest { repository { nameWithOwner } } } } }",
+        "variables": { "id": node_id }
+    });
+    let (verify_status, verify_body) = match execute_graphql(state, cred, graphql_url, &verify_payload).await {
+        Ok(result) => result,
+        Err(()) => {
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::BAD_GATEWAY,
+                "GitHub comment ownership check failed",
+            );
+        }
+    };
+    let viewer = verify_body.pointer("/data/viewer/login").and_then(|value| value.as_str());
+    let author = verify_body.pointer("/data/node/author/login").and_then(|value| value.as_str());
+    let actual_repo = verify_body
+        .pointer("/data/node/issue/repository/nameWithOwner")
+        .or_else(|| verify_body.pointer("/data/node/pullRequest/repository/nameWithOwner"))
+        .and_then(|value| value.as_str());
+    let expected_repo = format!("{}/{}", owner, repo);
+    if !verify_status.is_success()
+        || verify_body.get("errors").is_some()
+        || viewer.is_none()
+        || author.is_none()
+        || viewer.map(normalize_actor) != author.map(normalize_actor)
+    {
+        tracing::warn!("comment ownership check failed for {}/{}", owner, repo);
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            verify_status,
+            "comment is not authored by the current GitHub identity",
+        );
+    }
+    if actual_repo
+        .map(|value| value.eq_ignore_ascii_case(&expected_repo))
+        != Some(true)
+    {
+        tracing::warn!(
+            "comment repository mismatch: expected {}, actual {:?}",
+            expected_repo,
+            actual_repo
+        );
+        return local_tool_error(
+            frame.rpc_id.as_ref(),
+            StatusCode::FORBIDDEN,
+            "comment does not belong to the authorized repository",
+        );
+    }
+
+    let payload = serde_json::json!({
+        "query": "mutation MinimizeComment($subjectId: ID!, $classifier: ReportedContentClassifiers!) { minimizeComment(input: { subjectId: $subjectId, classifier: $classifier }) { minimizedComment { isMinimized } } }",
+        "variables": { "subjectId": node_id, "classifier": classifier }
+    });
+    let (status, body) = match execute_graphql(state, cred, graphql_url, &payload).await {
+        Ok(result) => result,
+        Err(()) => {
+            tracing::error!("custom minimize_comment request failed for {}/{}", owner, repo);
+            return local_tool_error(
+                frame.rpc_id.as_ref(),
+                StatusCode::BAD_GATEWAY,
+                "GitHub minimize comment request failed",
+            );
+        }
+    };
+    let minimized = body
+        .pointer("/data/minimizeComment/minimizedComment/isMinimized")
+        .and_then(|value| value.as_bool())
+        == Some(true);
+    if !status.is_success() || body.get("errors").is_some() || !minimized {
+        tracing::warn!("GitHub minimize_comment failed for {}/{}", owner, repo);
+        return local_tool_error(frame.rpc_id.as_ref(), status, "GitHub rejected comment minimization");
+    }
+
+    LocalToolResponse {
+        response: tool_response(
+            frame.rpc_id.as_ref(),
+            false,
+            StatusCode::OK,
+            format!("Comment minimized as {}", classifier),
+        ),
+        http_status: status.as_u16(),
+        tool_error: Some(false),
+    }
 }
 
 /// What a pinned MCP session is bound to: the exact credential serving it,
@@ -1332,8 +1712,16 @@ fn build_upstream_headers(
     }
     match agent {
         Some(a) if !a.tools.is_empty() => {
-            if let Ok(v) = a.tools.join(",").parse() {
-                h.insert("x-mcp-tools", v);
+            let upstream_tools: Vec<&str> = a
+                .tools
+                .iter()
+                .map(String::as_str)
+                .filter(|tool| *tool != MINIMIZE_COMMENT_TOOL)
+                .collect();
+            if !upstream_tools.is_empty() {
+                if let Ok(v) = upstream_tools.join(",").parse() {
+                    h.insert("x-mcp-tools", v);
+                }
             }
         }
         _ => {
@@ -1470,6 +1858,86 @@ mod tests {
             audit: None,
             write_inflight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         })
+    }
+
+    #[test]
+    fn test_custom_tool_definition_is_namespaced_and_write_shaped() {
+        let definition = custom_tool_definition();
+        assert_eq!(definition["name"], MINIMIZE_COMMENT_TOOL);
+        assert!(MINIMIZE_CLASSIFIERS.contains(&"OUTDATED"));
+        assert_eq!(crate::policy::classify_tool(MINIMIZE_COMMENT_TOOL), crate::policy::ToolKind::Write);
+    }
+
+    #[test]
+    fn test_inject_custom_tool_json_response() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+        let injected = inject_custom_tool(body, Some("application/json"), None).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+        assert_eq!(json["result"]["tools"][0]["name"], MINIMIZE_COMMENT_TOOL);
+    }
+
+    #[test]
+    fn test_inject_custom_tool_sse_response() {
+        let body = br#"event: message
+data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
+
+"#;
+        let injected = inject_custom_tool(body, Some("text/event-stream"), None).unwrap();
+        assert!(String::from_utf8(injected).unwrap().contains(MINIMIZE_COMMENT_TOOL));
+    }
+
+    #[test]
+    fn test_custom_tool_not_added_twice() {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":{{"tools":[{{"name":"{}"}}]}}}}"#,
+            MINIMIZE_COMMENT_TOOL
+        );
+        let injected = inject_custom_tool(body.as_bytes(), Some("application/json"), None).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+        assert_eq!(json["result"]["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_inject_custom_tool_filters_to_allowlist() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"issue_read"},{"name":"create_issue"}]}}"#;
+        let allowed = vec![MINIMIZE_COMMENT_TOOL.to_string(), "issue_read".to_string()];
+        let injected = inject_custom_tool(body, Some("application/json"), Some(&allowed)).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+        let names: Vec<&str> = json["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["issue_read", MINIMIZE_COMMENT_TOOL]);
+    }
+
+    #[test]
+    fn test_custom_tool_enabled_requires_allowlist_match() {
+        let allowed = agent("review", "key", &[MINIMIZE_COMMENT_TOOL]);
+        let other = agent("other", "key", &["issue_read"]);
+        assert!(custom_tool_enabled(Some(&allowed), MINIMIZE_COMMENT_TOOL));
+        assert!(!custom_tool_enabled(Some(&other), MINIMIZE_COMMENT_TOOL));
+        assert!(!custom_tool_enabled(None, MINIMIZE_COMMENT_TOOL));
+    }
+
+    #[test]
+    fn test_header_filter_preserves_upstream_tools() {
+        let client = HeaderMap::new();
+        let allowed = agent("review", "key", &[MINIMIZE_COMMENT_TOOL, "issue_read"]);
+        let headers = build_upstream_headers(&client, "token", &[], Some(&allowed)).unwrap();
+        assert_eq!(headers.get("x-mcp-tools").unwrap(), "issue_read");
+    }
+
+    #[test]
+    fn test_parse_sse_or_json_joins_multiline_data() {
+        let body = br#"event: message
+data: {"jsonrpc":"2.0",
+data: "id":1,"result":{"tools":[]}}
+
+"#;
+        let parsed = parse_sse_or_json(body, Some("text/event-stream")).unwrap();
+        assert_eq!(parsed["result"]["tools"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -2282,6 +2750,149 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    // ---- ghpool-owned tool: handler-level tests (mock GraphQL) ----
+
+    /// Mock api.github.com/graphql: VerifyComment queries answer with the
+    /// given author/repo (viewer is always the App bot identity, with the
+    /// "[bot]" suffix exactly as the live API returns it); MinimizeComment
+    /// mutations are recorded and succeed.
+    async fn spawn_mock_graphql(
+        author_login: &'static str,
+        node_repo: &'static str,
+        verify_errors: bool,
+    ) -> (String, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
+        use axum::{routing::post, Json, Router};
+        type Log = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+        let log: Log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        let handler = move |Json(body): Json<serde_json::Value>| {
+            let log = log2.clone();
+            async move {
+                let query = body["query"].as_str().unwrap_or_default().to_string();
+                if query.contains("MinimizeComment") {
+                    log.lock().unwrap().push(body);
+                    return Json(serde_json::json!({
+                        "data": {"minimizeComment": {"minimizedComment": {"isMinimized": true}}}
+                    }));
+                }
+                if verify_errors {
+                    return Json(serde_json::json!({
+                        "data": null,
+                        "errors": [{"message": "Could not resolve node"}]
+                    }));
+                }
+                Json(serde_json::json!({
+                    "data": {
+                        "viewer": {"login": "oab-ghpool[bot]"},
+                        "node": {
+                            "author": {"login": author_login},
+                            "issue": {"repository": {"nameWithOwner": node_repo}}
+                        }
+                    }
+                }))
+            }
+        };
+        let app = Router::new().route("/", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{}/", addr), log)
+    }
+
+    fn minimize_frame(owner: &str, repo: &str, classifier: &str) -> Frame {
+        Frame {
+            method: "tools/call".to_string(),
+            rpc_id: Some(serde_json::json!(1)),
+            tool: Some(MINIMIZE_COMMENT_TOOL.to_string()),
+            arguments: Some(serde_json::json!({
+                "owner": owner,
+                "repo": repo,
+                "node_id": "IC_kwDOtest",
+                "classifier": classifier,
+            })),
+        }
+    }
+
+    fn app_cred() -> McpCredential {
+        McpCredential::App(crate::app_token::AppToken {
+            token: "ghs_test".to_string(),
+            expires_at: now() + 3600,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_minimize_accepts_app_bot_authored_comment() {
+        // The live API returns viewer "oab-ghpool[bot]" but Bot comment
+        // authors carry the bare "oab-ghpool" login — the ownership check
+        // must accept the App's own comments (empirically verified shape).
+        let (gql, mutations) = spawn_mock_graphql("oab-ghpool", "openabdev/ghpool", false).await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = minimize_frame("openabdev", "ghpool", "OUTDATED");
+        let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.http_status, 200);
+        assert_eq!(out.tool_error, Some(false));
+        let recorded = mutations.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one mutation");
+        assert_eq!(recorded[0]["variables"]["subjectId"], "IC_kwDOtest");
+        assert_eq!(recorded[0]["variables"]["classifier"], "OUTDATED");
+    }
+
+    #[tokio::test]
+    async fn test_minimize_rejects_human_authored_comment() {
+        let (gql, mutations) = spawn_mock_graphql("chaodu-agent", "openabdev/ghpool", false).await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = minimize_frame("openabdev", "ghpool", "OUTDATED");
+        let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.tool_error, Some(true));
+        assert!(mutations.lock().unwrap().is_empty(), "no mutation for foreign authors");
+    }
+
+    #[tokio::test]
+    async fn test_minimize_rejects_repo_mismatch() {
+        // node_id belongs to another repository than the policy-checked
+        // owner/repo arguments — must be refused before the mutation.
+        let (gql, mutations) = spawn_mock_graphql("oab-ghpool", "openabdev/other-repo", false).await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = minimize_frame("openabdev", "ghpool", "OUTDATED");
+        let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.http_status, StatusCode::FORBIDDEN.as_u16());
+        assert_eq!(out.tool_error, Some(true));
+        assert!(mutations.lock().unwrap().is_empty(), "no cross-repo mutation");
+    }
+
+    #[tokio::test]
+    async fn test_minimize_rejects_graphql_errors_and_bad_classifier() {
+        // GraphQL soft errors (HTTP 200 + errors[]) fail closed.
+        let (gql, mutations) = spawn_mock_graphql("oab-ghpool", "openabdev/ghpool", true).await;
+        let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
+        let frame = minimize_frame("openabdev", "ghpool", "OUTDATED");
+        let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
+        assert_eq!(out.tool_error, Some(true));
+        assert!(mutations.lock().unwrap().is_empty());
+
+        // Unknown classifier is rejected before any network call.
+        let frame = minimize_frame("openabdev", "ghpool", "WRONG");
+        let out = handle_minimize_comment(&state, &app_cred(), &frame, "http://127.0.0.1:1/").await;
+        assert_eq!(out.tool_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_phase1_mode_denies_local_minimize_tool() {
+        // No agents → local write tools must not bypass the write gate and
+        // reach GitHub through the legacy PAT-backed path.
+        let (url, captured) = spawn_mock_upstream().await;
+        let state = test_state_full(&["alice"], &url, &[], vec![]);
+        let resp = mcp_app(state)
+            .oneshot(post_frame(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ghpool_review_minimize_comment","arguments":{"owner":"openabdev","repo":"ghpool","node_id":"MDU6SXNzdWUx","classifier":"OUTDATED"}}}"#,
+                &[],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(captured.lock().unwrap().len(), 0);
     }
 
     // ---- 2b-3: GitHub App credential backend ----
