@@ -6,6 +6,8 @@ on:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "ghp/**"
+      - ".github/workflows/ci.yml"
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,9 +21,21 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2 (2026-03-12)
+        with:
+          workspaces: |
+            .
+            ghp
       - name: cargo check
         run: cargo check
       - name: cargo clippy
         run: cargo clippy -- -D warnings
       - name: cargo test
         run: cargo test
+      # ghp is a separate crate (not a workspace member): the git credential
+      # helper's fail-closed contract must be enforced in CI too.
+      - name: ghp clippy
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: ghp
+      - name: ghp test
+        run: cargo test
+        working-directory: ghp

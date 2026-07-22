@@ -98,6 +98,46 @@ impl AuditSink {
         }))
     }
 
+    /// Pre-flight git credential issuance record. This MUST be persisted
+    /// before owner verification or token mint/cache lookup. An unaudited
+    /// token mint is forbidden even when the token is never returned.
+    pub fn record_git_credential_request(
+        &self,
+        agent: &str,
+        credential: &str,
+        repo: &str,
+    ) -> Result<(), String> {
+        self.append(serde_json::json!({
+            "ts": unix_now_ms(),
+            "phase": "git_credential_request",
+            "agent": agent,
+            "cred": credential,
+            "repo": repo,
+            "decision": "allow",
+        }))
+    }
+
+    /// Result record after owner verification + mint/cache lookup. A failure
+    /// to persist a successful result rejects the credential response.
+    pub fn record_git_credential_result(
+        &self,
+        agent: &str,
+        credential: &str,
+        repo: &str,
+        success: bool,
+        expires_at: Option<u64>,
+    ) -> Result<(), String> {
+        self.append(serde_json::json!({
+            "ts": unix_now_ms(),
+            "phase": "git_credential_result",
+            "agent": agent,
+            "cred": credential,
+            "repo": repo,
+            "success": success,
+            "expires_at": expires_at,
+        }))
+    }
+
     /// Append one JSONL record and fsync. Small blocking write on the async
     /// path — acceptable: write calls are rare and records are <1 KB.
     fn append(&self, record: serde_json::Value) -> Result<(), String> {

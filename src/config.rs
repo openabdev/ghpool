@@ -70,6 +70,14 @@ pub struct McpConfig {
     /// [mcp.audit] configured (writes are fail-closed audited).
     #[serde(default)]
     pub enable_writes: bool,
+    /// Enable the /git-credential endpoint: repository-scoped agents can
+    /// exchange their X-Ghpool-Key for a short-lived, single-repo GitHub App
+    /// installation token usable as a git-over-HTTPS credential
+    /// (username `x-access-token`). Hard requirements mirror enable_writes:
+    /// [[mcp.agents]], an App backend, and [mcp.audit] (every issuance is
+    /// fail-closed audited). The App needs Contents: read/write for pushes.
+    #[serde(default)]
+    pub enable_git_credentials: bool,
     /// Upstream MCP endpoint. Defaults to GitHub's hosted read-only variant,
     /// or the full write-capable surface when enable_writes is set.
     #[serde(default)]
@@ -185,6 +193,7 @@ impl Default for McpConfig {
         Self {
             enabled: false,
             enable_writes: false,
+            enable_git_credentials: false,
             upstream: None,
             toolsets: Vec::new(),
             session_ttl_secs: default_mcp_session_ttl(),
@@ -240,6 +249,27 @@ impl McpConfig {
                         ));
                     }
                 }
+            }
+        }
+        // Git credential issuance shares the write gate's hard requirements:
+        // authenticated agents, App-backed tokens (never PATs), and a
+        // fail-closed audit trail for every issuance.
+        if self.enable_git_credentials {
+            if self.agents.is_empty() {
+                return Err("enable_git_credentials requires [[mcp.agents]] — credentials are only issued to authenticated agents".into());
+            }
+            if self.github_app.is_none() && self.github_apps.is_empty() {
+                return Err("enable_git_credentials requires [mcp.github_app] or [[mcp.github_apps]] — git credentials are App installation tokens, never PATs".into());
+            }
+            if self.audit.is_none() {
+                return Err("enable_git_credentials requires [mcp.audit] — issuance is fail-closed audited".into());
+            }
+            if self
+                .github_app
+                .as_ref()
+                .is_some_and(|app| app.owner.as_deref().is_none_or(|o| o.trim().is_empty()))
+            {
+                return Err("enable_git_credentials with [mcp.github_app] requires `owner` — explicit installation IDs are verified against this owner before issuance".into());
             }
         }
         // Mutual exclusion: singular and plural forms cannot coexist
@@ -676,6 +706,7 @@ mod tests {
         wa.tools = vec!["issue_read".into(), "create_issue".into()];
         let m = McpConfig {
             enable_writes: true,
+            enable_git_credentials: false,
             github_apps: vec![entry("openabdev")],
             agents: vec![wa],
             audit: Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 }),
@@ -725,9 +756,97 @@ mod tests {
         let m = McpConfig {
             enabled: true,
             enable_writes: true,
+            enable_git_credentials: false,
             github_apps: vec![entry("openabdev"), entry("oablab")],
             agents: vec![multi_agent(&["openabdev/openab", "oablab/chi"])],
             audit: Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 }),
+            ..Default::default()
+        };
+        assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mcp_validate_git_credentials_gate() {
+        fn agent() -> McpAgentConfig {
+            McpAgentConfig {
+                id: "b0".into(),
+                key: None,
+                keys: vec!["k".into()],
+                tools: vec![],
+                repos: vec!["openabdev/openab".into()],
+            }
+        }
+        fn audit() -> Option<AuditConfig> {
+            Some(AuditConfig { path: "/tmp/a.jsonl".into(), max_result_bytes: 1024 })
+        }
+        fn single(owner: Option<&str>) -> Option<GithubAppConfig> {
+            Some(GithubAppConfig {
+                app_id: "1".into(),
+                private_key: "pem".into(),
+                installation_id: Some(1),
+                owner: owner.map(|s| s.to_string()),
+            })
+        }
+
+        // agents required
+        let m = McpConfig { enable_git_credentials: true, ..Default::default() };
+        assert!(m.validate().unwrap_err().contains("[[mcp.agents]]"));
+
+        // App backend required — never PATs
+        let m = McpConfig {
+            enable_git_credentials: true,
+            agents: vec![agent()],
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("never PATs"));
+
+        // audit required
+        let m = McpConfig {
+            enable_git_credentials: true,
+            agents: vec![agent()],
+            github_app: single(Some("openabdev")),
+            ..Default::default()
+        };
+        assert!(m.validate().unwrap_err().contains("[mcp.audit]"));
+
+        // singular App without owner: the explicit installation ID cannot be
+        // verified against an account, so startup must fail
+        for owner in [None, Some(""), Some("  ")] {
+            let m = McpConfig {
+                enable_git_credentials: true,
+                agents: vec![agent()],
+                github_app: single(owner),
+                audit: audit(),
+                ..Default::default()
+            };
+            assert!(
+                m.validate().unwrap_err().contains("requires `owner`"),
+                "owner {:?} must be rejected",
+                owner
+            );
+        }
+
+        // singular App with owner set: valid
+        let m = McpConfig {
+            enable_git_credentials: true,
+            agents: vec![agent()],
+            github_app: single(Some("openabdev")),
+            audit: audit(),
+            ..Default::default()
+        };
+        assert!(m.validate().is_ok());
+
+        // multi-App form (owners inherent to entries): valid
+        let m = McpConfig {
+            enable_git_credentials: true,
+            agents: vec![agent()],
+            github_apps: vec![GithubAppsEntry {
+                app_id: "1".into(),
+                private_key: "pem".into(),
+                installation_id: Some(1),
+                owner: "openabdev".into(),
+            }],
+            audit: audit(),
             ..Default::default()
         };
         assert!(m.validate().is_ok());

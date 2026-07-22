@@ -459,6 +459,74 @@ Trade-off vs. one key per org: a leaked key reaches the allowlisted repos of
 **all** configured installations. Prefer separate agents/keys when you want
 per-org blast-radius isolation.
 
+#### Git over HTTPS via App tokens (`/git-credential`)
+
+MCP covers issues and PRs, but `git push` speaks the Git protocol — it needs
+a real credential at push time. `enable_git_credentials` lets a
+repository-scoped agent exchange its ghpool key for a **short-lived,
+single-repo** App installation token, eliminating the last long-lived GitHub
+credential in the agent container:
+
+```toml
+[mcp]
+enable_git_credentials = true   # same hard gate as writes:
+                                # agents + App backend + [mcp.audit]
+```
+
+The App needs **Contents: Read & write** on the target repositories. With
+the singular `[mcp.github_app]` form, `owner` is **required** when git
+credentials are enabled — the explicit `installation_id` is verified against
+the installation's actual account before any token is issued.
+
+Agent side, `ghp` doubles as a standard git credential helper. Register it
+as the **only** helper for `github.com` — `--replace-all` with an empty
+first entry clears any inherited helpers (osxkeychain, GCM, `gh auth
+git-credential`) that would otherwise supply broader credentials:
+
+```sh
+git config --global --replace-all credential."https://github.com".helper ""
+git config --global --add credential."https://github.com".helper "!ghp git-credential"
+git config --global credential."https://github.com".useHttpPath true
+```
+
+Every `git push` then flows:
+
+```
+git push → ghp git-credential (GHPOOL_KEY from env)
+         → GET /git-credential?repo=owner/name   (X-Ghpool-Key)
+         → key auth → repo allowlist → installation routing
+         → durable audit preflight (phase: git_credential_request)
+         → installation owner verified against GitHub
+         → Contents-only single-repo token (~1h, GitHub-enforced scope)
+         → audit result (phase: git_credential_result)
+         → push authenticated as <app>[bot]
+```
+
+Properties:
+
+- **Single-repo, Contents-only tokens** — each credential is minted with
+  exactly the repo being pushed and `contents: write` only, never the App's
+  full permission set; GitHub itself enforces both boundaries. Git tokens
+  are cached separately from MCP tokens.
+- **Owner binding** — the configured owner label is verified against the
+  actual installation account (`GET /app/installations/{id}`) before
+  issuance and re-verified hourly (accounts can rename); a mislabeled
+  installation ID is refused.
+- **Fail-closed audit** — a request record is persisted *before* any mint or
+  cache lookup, and a result record before the token is returned; if either
+  write fails, no credential (503). The token value is never written to the
+  audit log.
+- **Deny-by-default** — repo-less agents, off-allowlist repos, and owners
+  without an installation are refused before any mint.
+- **Fail-closed helper** — once a request is recognized as `github.com`
+  HTTPS, any failure (missing `GHPOOL_KEY`, missing path, policy denial,
+  network error) makes `ghp` emit `quit=true`, telling git to stop the
+  helper cascade instead of falling through to broader stored credentials
+  or prompting. Non-GitHub hosts are declined quietly so other helpers can
+  serve them. `gist.github.com` is not supported.
+- **Nothing to store** — `store`/`erase` are no-ops; tokens expire on their
+  own. `cache-control: no-store` on the response.
+
 Deployment notes:
 
 - Requires egress to `api.githubcopilot.com` (the only additional external dependency).

@@ -23,6 +23,16 @@ use serde::Deserialize;
 /// handed to an in-flight request stays valid for the request's lifetime.
 const REFRESH_MARGIN: Duration = Duration::from_secs(300);
 
+/// Owner verification is re-checked this often. GitHub accounts can rename
+/// (and freed names can be re-claimed), so a verified owner→installation
+/// binding must not live for the whole process lifetime.
+const VERIFY_TTL: Duration = Duration::from_secs(3600);
+
+/// Hard ceiling on any single GitHub App API call (JWT-authenticated mint,
+/// installation resolution/verification). Without it a stalled connection
+/// would hold a singleflight waiter queue indefinitely.
+const MINT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A minted installation token plus its expiry (unix seconds).
 #[derive(Clone, Debug)]
 pub struct AppToken {
@@ -38,9 +48,21 @@ pub struct AppTokenProvider {
     owner: Option<String>,
     api_base: String,
     http: reqwest::Client,
-    /// Cache keyed by scope envelope ("" = installation-wide; otherwise the
-    /// sorted repo list). One credential per policy envelope.
+    /// Cache keyed by purpose + scope envelope. MCP and git credentials are
+    /// intentionally isolated: a repo-scoped MCP token may carry broader App
+    /// permissions and must never satisfy a git credential request.
     cached: Mutex<HashMap<String, AppToken>>,
+    /// Per-key singleflight locks: concurrent misses for the SAME cache key
+    /// wait for one mint; distinct keys (different repos or purposes) mint
+    /// in parallel so one slow mint cannot stall unrelated issuance.
+    /// Entries are evicted when the mint completes, so the map is bounded
+    /// by in-flight mints — request-supplied repo names (e.g. failed mints
+    /// under a wildcard allowlist) cannot accumulate.
+    mint_locks: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// Owner verified from GitHub's installation API for an explicit ID,
+    /// with the verification time — re-checked after VERIFY_TTL. The
+    /// configured owner label is not trusted by itself.
+    verified_owner: Mutex<Option<(String, u64)>>,
 }
 
 #[derive(Deserialize)]
@@ -52,6 +74,12 @@ struct TokenResponse {
 #[derive(Deserialize)]
 struct Installation {
     id: u64,
+    account: Option<InstallationAccount>,
+}
+
+#[derive(Deserialize)]
+struct InstallationAccount {
+    login: String,
 }
 
 impl AppTokenProvider {
@@ -75,8 +103,13 @@ impl AppTokenProvider {
             installation_id: Mutex::new(installation_id),
             owner,
             api_base,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(MINT_TIMEOUT)
+                .build()
+                .map_err(|e| format!("http client build failed: {}", e))?,
             cached: Mutex::new(HashMap::new()),
+            mint_locks: Mutex::new(HashMap::new()),
+            verified_owner: Mutex::new(None),
         })
     }
 
@@ -92,9 +125,31 @@ impl AppTokenProvider {
     /// enforces the boundary. Empty slice = installation-wide. Tokens are
     /// cached per envelope and refreshed near expiry.
     pub async fn token_scoped(&self, repositories: &[String]) -> Result<AppToken, String> {
+        self.token_for("mcp", repositories, None).await
+    }
+
+    /// Git-over-HTTPS credential: a distinct cache namespace and a
+    /// least-privilege permission envelope. `contents:write` is sufficient
+    /// for fetch/push and prevents the returned token from bypassing MCP tool
+    /// policy for issues, PRs, Actions, administration, etc.
+    pub async fn token_git(&self, repository: &str) -> Result<AppToken, String> {
+        self.token_for(
+            "git:contents=write",
+            &[repository.to_string()],
+            Some(serde_json::json!({ "contents": "write" })),
+        )
+        .await
+    }
+
+    async fn token_for(
+        &self,
+        purpose: &str,
+        repositories: &[String],
+        permissions: Option<serde_json::Value>,
+    ) -> Result<AppToken, String> {
         let mut envelope: Vec<String> = repositories.to_vec();
         envelope.sort();
-        let key = envelope.join(",");
+        let key = format!("{}:{}", purpose, envelope.join(","));
 
         let now = unix_now();
         if let Some(t) = self.cached.lock().unwrap().get(&key) {
@@ -102,12 +157,59 @@ impl AppTokenProvider {
                 return Ok(t.clone());
             }
         }
-        let fresh = self.mint(&envelope).await?;
-        self.cached.lock().unwrap().insert(key, fresh.clone());
-        Ok(fresh)
+        // Key-scoped singleflight: concurrent misses for the SAME key wait
+        // for one mint and then re-check the cache; distinct keys proceed in
+        // parallel so a slow mint never stalls unrelated issuance.
+        let key_lock = self
+            .mint_locks
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _mint_guard = key_lock.lock().await;
+        if let Some(t) = self.cached.lock().unwrap().get(&key) {
+            if t.expires_at > unix_now() + REFRESH_MARGIN.as_secs() {
+                // fulfilled by the leader while we waited — evict our own
+                // generation too in case the leader's eviction raced our
+                // map insert
+                self.evict_mint_lock(&key, &key_lock);
+                return Ok(t.clone());
+            }
+        }
+        let result = self.mint(&envelope, permissions.as_ref()).await;
+        if let Ok(fresh) = &result {
+            self.cached.lock().unwrap().insert(key.clone(), fresh.clone());
+        }
+        // Evict the singleflight entry whether the mint succeeded or failed:
+        // waiters already holding this Arc still serialize behind it and
+        // re-check the cache; the next fresh miss creates a new lock. This
+        // bounds the map to in-flight mints instead of every key ever seen.
+        self.evict_mint_lock(&key, &key_lock);
+        result
     }
 
-    async fn mint(&self, repositories: &[String]) -> Result<AppToken, String> {
+    /// Remove a singleflight entry only if it is still OUR generation.
+    /// A stale waiter from an evicted generation must never remove a newer
+    /// generation's in-flight lock — that would let a third caller mint
+    /// concurrently and unboundedly repeat the race. With the ptr_eq guard,
+    /// each generation removes at most itself, so duplicate mints are
+    /// bounded to one per evicted generation.
+    fn evict_mint_lock(&self, key: &str, ours: &std::sync::Arc<tokio::sync::Mutex<()>>) {
+        let mut locks = self.mint_locks.lock().unwrap();
+        if locks
+            .get(key)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, ours))
+        {
+            locks.remove(key);
+        }
+    }
+
+    async fn mint(
+        &self,
+        repositories: &[String],
+        permissions: Option<&serde_json::Value>,
+    ) -> Result<AppToken, String> {
         let jwt = self.sign_jwt()?;
         let installation_id = self.resolve_installation(&jwt).await?;
 
@@ -115,16 +217,23 @@ impl AppTokenProvider {
             "{}/app/installations/{}/access_tokens",
             self.api_base, installation_id
         );
+        let mut body = serde_json::Map::new();
+        if !repositories.is_empty() {
+            // Scope the token to explicit repositories (names within the
+            // VERIFIED installation owner). GitHub rejects unknown repos.
+            body.insert("repositories".into(), serde_json::json!(repositories));
+        }
+        if let Some(p) = permissions {
+            body.insert("permissions".into(), p.clone());
+        }
         let mut req = self
             .http
             .post(&url)
             .header("Authorization", format!("Bearer {}", jwt))
             .header("Accept", "application/vnd.github+json")
             .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")));
-        if !repositories.is_empty() {
-            // Scope the token to explicit repositories (names within the
-            // installation's owner). GitHub rejects unknown repos at mint.
-            req = req.json(&serde_json::json!({ "repositories": repositories }));
+        if !body.is_empty() {
+            req = req.json(&body);
         }
         let resp = req
             .send()
@@ -154,6 +263,59 @@ impl AppTokenProvider {
             expires_at.saturating_sub(unix_now())
         );
         Ok(AppToken { token: tr.token, expires_at })
+    }
+
+    /// Verify that this provider's installation belongs to `expected_owner`.
+    /// This is mandatory before credential issuance: an explicit
+    /// installation ID plus an operator-supplied owner label is not an
+    /// identity binding. Without this API check, same-named repositories in
+    /// different accounts could receive a token under a misbound route.
+    pub async fn verify_owner(&self, expected_owner: &str) -> Result<(), String> {
+        let expected = expected_owner.to_lowercase();
+        if self
+            .verified_owner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|(o, at)| *o == expected && at + VERIFY_TTL.as_secs() > unix_now())
+        {
+            return Ok(());
+        }
+        let jwt = self.sign_jwt()?;
+        let installation_id = self.resolve_installation(&jwt).await?;
+        let url = format!("{}/app/installations/{}", self.api_base, installation_id);
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", jwt))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
+            .send()
+            .await
+            .map_err(|e| format!("installation owner verification failed: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!(
+                "installation owner verification failed: GitHub returned {}",
+                resp.status()
+            ));
+        }
+        let installation: Installation = resp
+            .json()
+            .await
+            .map_err(|e| format!("installation owner response parse failed: {}", e))?;
+        let actual = installation
+            .account
+            .ok_or_else(|| "installation owner response missing account".to_string())?
+            .login
+            .to_lowercase();
+        if actual != expected {
+            return Err(format!(
+                "installation {} belongs to owner '{}', not configured owner '{}'",
+                installation_id, actual, expected_owner
+            ));
+        }
+        *self.verified_owner.lock().unwrap() = Some((actual, unix_now()));
+        Ok(())
     }
 
     async fn resolve_installation(&self, jwt: &str) -> Result<u64, String> {
@@ -371,7 +533,7 @@ pub(crate) mod tests {
 
         // Force near-expiry → refresh mints again
         p.cached.lock().unwrap().insert(
-            String::new(),
+            "mcp:".to_string(),
             AppToken { token: "ghs_mock_1".into(), expires_at: unix_now() + 10 },
         );
         let t3 = p.token().await.unwrap();
@@ -389,5 +551,299 @@ pub(crate) mod tests {
         let s3 = p.token_scoped(&["ghpool".into(), "openab".into()]).await.unwrap();
         assert_eq!(s3.token, "ghs_mock_4");
         assert_eq!(MINTS.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn test_git_token_downscopes_permissions_and_isolates_cache() {
+        use axum::{extract::State, routing::post, Json, Router};
+        use std::sync::Arc;
+
+        type Bodies = Arc<Mutex<Vec<serde_json::Value>>>;
+        async fn mint(
+            State(bodies): State<Bodies>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            bodies.lock().unwrap().push(body);
+            let n = bodies.lock().unwrap().len();
+            let exp = time::OffsetDateTime::from_unix_timestamp((unix_now() + 3600) as i64)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            Json(serde_json::json!({
+                "token": format!("ghs_scope_{}", n),
+                "expires_at": exp,
+            }))
+        }
+
+        let bodies: Bodies = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/app/installations/42/access_tokens", post(mint))
+            .with_state(bodies.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let p = AppTokenProvider::new(
+            "123".into(),
+            TEST_RSA_PEM,
+            Some(42),
+            None,
+            format!("http://{}", addr),
+        )
+        .unwrap();
+
+        // MCP token first: same repo, default App permissions.
+        let mcp = p.token_scoped(&["openab".into()]).await.unwrap();
+        // Git token MUST mint separately despite identical repo envelope.
+        let git = p.token_git("openab").await.unwrap();
+        assert_ne!(mcp.token, git.token);
+        // Repeated git lookup hits its own cache.
+        assert_eq!(p.token_git("openab").await.unwrap().token, git.token);
+
+        let seen = bodies.lock().unwrap();
+        assert_eq!(seen.len(), 2, "MCP and git cache namespaces must not overlap");
+        assert_eq!(seen[0]["repositories"], serde_json::json!(["openab"]));
+        assert!(seen[0].get("permissions").is_none());
+        assert_eq!(seen[1]["repositories"], serde_json::json!(["openab"]));
+        assert_eq!(
+            seen[1]["permissions"],
+            serde_json::json!({"contents": "write"})
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_owner_binds_explicit_installation_id() {
+        use axum::{routing::get, Router};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static HITS: AtomicU32 = AtomicU32::new(0);
+        let app = Router::new().route(
+            "/app/installations/42",
+            get(|| async {
+                HITS.fetch_add(1, Ordering::SeqCst);
+                axum::Json(serde_json::json!({
+                    "id": 42,
+                    "account": {"login": "openabdev"}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let p = AppTokenProvider::new(
+            "123".into(),
+            TEST_RSA_PEM,
+            Some(42),
+            Some("openabdev".into()),
+            format!("http://{}", addr),
+        )
+        .unwrap();
+
+        p.verify_owner("OpenABdev").await.unwrap();
+        assert_eq!(HITS.load(Ordering::SeqCst), 1);
+        // fresh verification is cached — no second API call
+        p.verify_owner("openabdev").await.unwrap();
+        assert_eq!(HITS.load(Ordering::SeqCst), 1);
+        // a stale verification (past VERIFY_TTL) is re-checked with GitHub:
+        // orgs can rename, so the binding must not live forever
+        *p.verified_owner.lock().unwrap() =
+            Some(("openabdev".into(), unix_now() - VERIFY_TTL.as_secs() - 1));
+        p.verify_owner("openabdev").await.unwrap();
+        assert_eq!(HITS.load(Ordering::SeqCst), 2);
+
+        let err = p.verify_owner("oablab").await.unwrap_err();
+        assert!(err.contains("belongs to owner 'openabdev'"));
+        assert!(err.contains("not configured owner 'oablab'"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_misses_mint_once() {
+        use axum::{routing::post, Router};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        static MINTS2: AtomicU32 = AtomicU32::new(0);
+        let app = Router::new().route(
+            "/app/installations/7/access_tokens",
+            post(|| async {
+                MINTS2.fetch_add(1, Ordering::SeqCst);
+                // slow mint so concurrent callers overlap the await
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let exp = time::OffsetDateTime::from_unix_timestamp((unix_now() + 3600) as i64)
+                    .unwrap()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap();
+                axum::Json(serde_json::json!({"token": "ghs_single", "expires_at": exp}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let p = Arc::new(
+            AppTokenProvider::new(
+                "123".into(),
+                TEST_RSA_PEM,
+                Some(7),
+                None,
+                format!("http://{}", addr),
+            )
+            .unwrap(),
+        );
+        let (a, b, c) = tokio::join!(
+            p.token_git("openab"),
+            p.token_git("openab"),
+            p.token_git("openab"),
+        );
+        assert_eq!(a.unwrap().token, "ghs_single");
+        assert_eq!(b.unwrap().token, "ghs_single");
+        assert_eq!(c.unwrap().token, "ghs_single");
+        assert_eq!(
+            MINTS2.load(Ordering::SeqCst),
+            1,
+            "singleflight: concurrent misses must mint exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_distinct_keys_mint_in_parallel() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        // The "slowrepo" mint stalls; "fastrepo" answers immediately. A
+        // slow mint for one key must not delay issuance for another key.
+        async fn mint(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            let repos = body["repositories"].as_array().cloned().unwrap_or_default();
+            if repos.iter().any(|r| r == "slowrepo") {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            let exp = time::OffsetDateTime::from_unix_timestamp((unix_now() + 3600) as i64)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            Json(serde_json::json!({
+                "token": format!("ghs_{}", repos[0].as_str().unwrap()),
+                "expires_at": exp,
+            }))
+        }
+        let app = Router::new().route("/app/installations/8/access_tokens", post(mint));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let p = Arc::new(
+            AppTokenProvider::new(
+                "123".into(),
+                TEST_RSA_PEM,
+                Some(8),
+                None,
+                format!("http://{}", addr),
+            )
+            .unwrap(),
+        );
+        let start = Instant::now();
+        let slow = {
+            let p = p.clone();
+            tokio::spawn(async move { p.token_git("slowrepo").await })
+        };
+        // give the slow mint a head start so its lock is held
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let fast = p.token_git("fastrepo").await.unwrap();
+        let fast_elapsed = start.elapsed();
+        assert_eq!(fast.token, "ghs_fastrepo");
+        assert!(
+            fast_elapsed < std::time::Duration::from_millis(400),
+            "distinct key must not wait behind a slow mint (took {:?})",
+            fast_elapsed
+        );
+        let slow = slow.await.unwrap().unwrap();
+        assert_eq!(slow.token, "ghs_slowrepo");
+        assert!(start.elapsed() >= std::time::Duration::from_millis(500));
+        // singleflight entries are evicted once mints complete — the map
+        // must not grow with every key ever requested
+        assert!(p.mint_locks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mint_locks_evicted_after_success_and_failure() {
+        use axum::{routing::post, Json, Router};
+
+        // "badrepo*" fails to mint; "goodrepo" succeeds.
+        async fn mint(Json(body): Json<serde_json::Value>) -> axum::response::Response {
+            let repos = body["repositories"].as_array().cloned().unwrap_or_default();
+            if repos.iter().any(|r| r.as_str().unwrap().starts_with("badrepo")) {
+                return axum::response::Response::builder()
+                    .status(422)
+                    .body(axum::body::Body::from("{\"message\":\"not found\"}"))
+                    .unwrap();
+            }
+            let exp = time::OffsetDateTime::from_unix_timestamp((unix_now() + 3600) as i64)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            axum::response::Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"token": "ghs_good", "expires_at": exp}).to_string(),
+                ))
+                .unwrap()
+        }
+        let app = Router::new().route("/app/installations/9/access_tokens", post(mint));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let p = AppTokenProvider::new(
+            "123".into(),
+            TEST_RSA_PEM,
+            Some(9),
+            None,
+            format!("http://{}", addr),
+        )
+        .unwrap();
+
+        p.token_git("goodrepo").await.unwrap();
+        assert!(p.mint_locks.lock().unwrap().is_empty(), "evicted on success");
+
+        // A wildcard-allowlisted agent can request arbitrary names; failed
+        // mints must not leave lock entries behind (unbounded growth).
+        for i in 0..5 {
+            p.token_git(&format!("badrepo{}", i)).await.unwrap_err();
+        }
+        assert!(p.mint_locks.lock().unwrap().is_empty(), "evicted on failure");
+    }
+
+    #[test]
+    fn test_evict_mint_lock_is_generation_guarded() {
+        let p = AppTokenProvider::new(
+            "123".into(),
+            TEST_RSA_PEM,
+            Some(1),
+            None,
+            "http://x".into(),
+        )
+        .unwrap();
+        let gen_a = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let gen_b = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+
+        // Map holds generation B (a newer in-flight mint); a stale waiter
+        // from evicted generation A must NOT remove it.
+        p.mint_locks
+            .lock()
+            .unwrap()
+            .insert("k".into(), gen_b.clone());
+        p.evict_mint_lock("k", &gen_a);
+        assert!(
+            p.mint_locks.lock().unwrap().contains_key("k"),
+            "a stale generation must never evict a newer generation's lock"
+        );
+        // The owning generation removes itself.
+        p.evict_mint_lock("k", &gen_b);
+        assert!(p.mint_locks.lock().unwrap().is_empty());
+        // Evicting an absent key is a no-op.
+        p.evict_mint_lock("k", &gen_b);
+        assert!(p.mint_locks.lock().unwrap().is_empty());
     }
 }
