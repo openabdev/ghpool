@@ -952,8 +952,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghpool"
-version = "0.3.4"
+name = "octobroker"
+version = "0.6.0"
 dependencies = [
  "aws-config",
  "aws-sdk-secretsmanager",

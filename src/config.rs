@@ -57,7 +57,7 @@ impl Default for CacheConfig {
 }
 
 /// MCP reverse proxy configuration (Phase 1: read-only).
-/// When enabled, ghpool proxies MCP Streamable HTTP traffic on /mcp to the
+/// When enabled, octobroker proxies MCP Streamable HTTP traffic on /mcp to the
 /// GitHub-hosted MCP server, injecting a pooled credential upstream so agents
 /// never hold a GitHub token.
 #[derive(Clone, Deserialize)]
@@ -71,7 +71,7 @@ pub struct McpConfig {
     #[serde(default)]
     pub enable_writes: bool,
     /// Enable the /git-credential endpoint: repository-scoped agents can
-    /// exchange their X-Ghpool-Key for a short-lived, single-repo GitHub App
+    /// exchange their X-Octobroker-Key for a short-lived, single-repo GitHub App
     /// installation token usable as a git-over-HTTPS credential
     /// (username `x-access-token`). Hard requirements mirror enable_writes:
     /// [[mcp.agents]], an App backend, and [mcp.audit] (every issuance is
@@ -94,7 +94,7 @@ pub struct McpConfig {
     pub max_inflight_writes: usize,
     /// Per-agent authentication + default-deny tool allowlists (Phase 2a).
     /// Empty = Phase 1 network-trust mode (no agent authn on /mcp).
-    /// Non-empty = every /mcp request must present a valid X-Ghpool-Key.
+    /// Non-empty = every /mcp request must present a valid X-Octobroker-Key.
     #[serde(default)]
     pub agents: Vec<McpAgentConfig>,
     /// GitHub App credential backend (Phase 2b). When configured, the MCP
@@ -166,7 +166,7 @@ pub struct GithubAppsEntry {
 #[derive(Clone, Deserialize)]
 pub struct McpAgentConfig {
     pub id: String,
-    /// Shared key presented via X-Ghpool-Key (single-key form). Supports the
+    /// Shared key presented via X-Octobroker-Key (single-key form). Supports the
     /// same secret reference formats as identity tokens; resolved at load.
     #[serde(default)]
     pub key: Option<String>,
@@ -387,7 +387,7 @@ impl Config {
                     return config;
                 }
                 Err(e) => {
-                    // Most likely a typo'd GHPOOL_CONFIG — don't fail silently
+                    // Most likely a typo'd OCTOBROKER_CONFIG — don't fail silently
                     tracing::warn!("cannot read config at {}: {} — falling back to env-only mode", path, e);
                 }
             }
@@ -396,13 +396,13 @@ impl Config {
 
         // Fallback: env vars only
         let identities = Self::identities_from_env();
-        let allowed_owners = std::env::var("GHPOOL_ALLOWED_OWNERS")
+        let allowed_owners = std::env::var("OCTOBROKER_ALLOWED_OWNERS")
             .unwrap_or_default()
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        let port = std::env::var("GHPOOL_PORT")
+        let port = std::env::var("OCTOBROKER_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(default_port());
@@ -413,14 +413,14 @@ impl Config {
     }
 
     /// Config file search order:
-    /// 1. GHPOOL_CONFIG env var (explicit always wins; if set but unreadable,
+    /// 1. OCTOBROKER_CONFIG env var (explicit always wins; if set but unreadable,
     ///    a warning is logged and no other file is tried)
     /// 2. ./config.toml (repo-local dev)
-    /// 3. $XDG_CONFIG_HOME/ghpool/config.toml (default ~/.config/ghpool/)
+    /// 3. $XDG_CONFIG_HOME/octobroker/config.toml (default ~/.config/octobroker/)
     ///
     /// Returns None when nothing is found → env-only mode.
     fn resolve_config_path() -> Option<String> {
-        if let Ok(p) = std::env::var("GHPOOL_CONFIG") {
+        if let Ok(p) = std::env::var("OCTOBROKER_CONFIG") {
             return Some(p);
         }
         if std::path::Path::new("config.toml").exists() {
@@ -430,7 +430,7 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty())
             .or_else(|| std::env::var("HOME").ok().map(|h| format!("{}/.config", h)))?;
-        let xdg_path = format!("{}/ghpool/config.toml", xdg_base);
+        let xdg_path = format!("{}/octobroker/config.toml", xdg_base);
         if std::path::Path::new(&xdg_path).exists() {
             return Some(xdg_path);
         }
@@ -478,22 +478,22 @@ impl Config {
     }
 
     fn apply_env_overrides(&mut self) {
-        if let Ok(v) = std::env::var("GHPOOL_PORT") {
+        if let Ok(v) = std::env::var("OCTOBROKER_PORT") {
             if let Ok(p) = v.parse() { self.port = p; }
         }
-        if let Ok(v) = std::env::var("GHPOOL_ALLOWED_OWNERS") {
+        if let Ok(v) = std::env::var("OCTOBROKER_ALLOWED_OWNERS") {
             self.allowed_owners = v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         }
-        if let Ok(v) = std::env::var("GHPOOL_MCP_ENABLED") {
+        if let Ok(v) = std::env::var("OCTOBROKER_MCP_ENABLED") {
             self.mcp.enabled = matches!(v.to_lowercase().as_str(), "1" | "true" | "yes");
         }
     }
 
     fn identities_from_env() -> Vec<IdentityConfig> {
         std::env::vars()
-            .filter(|(k, _)| k.starts_with("GHPOOL_PAT_"))
+            .filter(|(k, _)| k.starts_with("OCTOBROKER_PAT_"))
             .map(|(k, v)| IdentityConfig {
-                id: k.strip_prefix("GHPOOL_PAT_").unwrap().to_lowercase(),
+                id: k.strip_prefix("OCTOBROKER_PAT_").unwrap().to_lowercase(),
                 token: v,
             })
             .collect()
@@ -564,17 +564,17 @@ mod tests {
         // Single test covering the whole chain to avoid parallel-test races
         // on process-global state (env vars + cwd; no other test touches
         // either).
-        let tmp = std::env::temp_dir().join(format!("ghpool-cfg-test-{}", std::process::id()));
-        let ghpool_dir = tmp.join("ghpool");
+        let tmp = std::env::temp_dir().join(format!("octobroker-cfg-test-{}", std::process::id()));
+        let octobroker_dir = tmp.join("octobroker");
         let cwd_dir = tmp.join("cwd");
-        fs::create_dir_all(&ghpool_dir).unwrap();
+        fs::create_dir_all(&octobroker_dir).unwrap();
         fs::create_dir_all(&cwd_dir).unwrap();
 
         // Run from an empty cwd so a developer's local ./config.toml doesn't
         // affect the outcome.
         let orig_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(&cwd_dir).unwrap();
-        std::env::remove_var("GHPOOL_CONFIG");
+        std::env::remove_var("OCTOBROKER_CONFIG");
         std::env::set_var("XDG_CONFIG_HOME", &tmp);
 
         assert_eq!(Config::resolve_config_path(), None, "no file anywhere → env-only");
@@ -589,7 +589,7 @@ mod tests {
         fs::remove_file(cwd_dir.join("config.toml")).unwrap();
 
         // XDG file exists → picked up
-        let xdg_file = ghpool_dir.join("config.toml");
+        let xdg_file = octobroker_dir.join("config.toml");
         fs::write(&xdg_file, "port = 1234\n").unwrap();
         assert_eq!(
             Config::resolve_config_path().as_deref(),
@@ -597,15 +597,15 @@ mod tests {
             "XDG path found"
         );
 
-        // Explicit GHPOOL_CONFIG wins over XDG, even if the path doesn't exist
-        std::env::set_var("GHPOOL_CONFIG", "/nonexistent/override.toml");
+        // Explicit OCTOBROKER_CONFIG wins over XDG, even if the path doesn't exist
+        std::env::set_var("OCTOBROKER_CONFIG", "/nonexistent/override.toml");
         assert_eq!(
             Config::resolve_config_path().as_deref(),
             Some("/nonexistent/override.toml"),
             "explicit env var always wins"
         );
 
-        std::env::remove_var("GHPOOL_CONFIG");
+        std::env::remove_var("OCTOBROKER_CONFIG");
         std::env::remove_var("XDG_CONFIG_HOME");
         std::env::set_current_dir(orig_cwd).unwrap();
         fs::remove_dir_all(&tmp).ok();

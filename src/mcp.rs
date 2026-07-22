@@ -18,7 +18,7 @@
 //! NOTE: `allowed_owners` is NOT enforced on /mcp in Phase 1 — doing so
 //! requires tool-argument inspection. Access is bounded by the pooled token's
 //! own permissions and the read-only upstream. Per-agent policy is tracked in
-//! https://github.com/openabdev/ghpool/issues/17.
+//! https://github.com/openabdev/octobroker/issues/17.
 
 use futures_util::StreamExt as _;
 
@@ -52,9 +52,9 @@ const FWD_HEADERS: &[&str] = &[
     "last-event-id",
 ];
 
-/// ghpool-owned MCP tools are namespaced so they cannot collide with tools
+/// octobroker-owned MCP tools are namespaced so they cannot collide with tools
 /// exposed by GitHub's hosted MCP server.
-const MINIMIZE_COMMENT_TOOL: &str = "ghpool_review_minimize_comment";
+const MINIMIZE_COMMENT_TOOL: &str = "octobroker_review_minimize_comment";
 const GITHUB_GRAPHQL_URL: &str = "https://api.github.com/graphql";
 const MINIMIZE_CLASSIFIERS: &[&str] = &[
     "ABUSE",
@@ -181,7 +181,7 @@ pub async fn mcp_proxy(
         }
     }
 
-    // Local ghpool-owned tools are writes even when the upstream policy block
+    // Local octobroker-owned tools are writes even when the upstream policy block
     // is bypassed (for example, in no-agent/network-trust mode). Keep the
     // local mutation path fail-closed and before credential resolution.
     if frame.as_ref().and_then(|f| f.tool.as_deref()) == Some(MINIMIZE_COMMENT_TOOL)
@@ -332,7 +332,7 @@ pub async fn mcp_proxy(
         }
     }
 
-    // ghpool-owned review tools are handled locally. All policy and audit
+    // octobroker-owned review tools are handled locally. All policy and audit
     // checks above still apply; the upstream GitHub MCP server is not asked
     // to interpret a tool it does not expose.
     if frame.as_ref().and_then(|f| f.tool.as_deref()) == Some(MINIMIZE_COMMENT_TOOL) {
@@ -487,7 +487,7 @@ pub async fn mcp_proxy(
         }
     }
 
-    // Add ghpool-owned tools only to an authenticated agent's advertised
+    // Add octobroker-owned tools only to an authenticated agent's advertised
     // surface when that agent explicitly allowlists the tool. The upstream
     // response remains untouched for all other agents and requests.
     if frame.as_ref().map(|f| f.method.as_str()) == Some("tools/list")
@@ -774,7 +774,7 @@ async fn execute_graphql(
         .http
         .post(graphql_url)
         .bearer_auth(cred.token())
-        .header("user-agent", concat!("ghpool/", env!("CARGO_PKG_VERSION")))
+        .header("user-agent", concat!("octobroker/", env!("CARGO_PKG_VERSION")))
         .header("content-type", "application/json")
         .json(payload)
         .timeout(std::time::Duration::from_secs(POST_TIMEOUT_SECS))
@@ -1623,7 +1623,7 @@ impl Drop for InFlightGuard {
 
 /// Phase 2a agent authentication.
 /// - No [[mcp.agents]] configured → Phase 1 network-trust mode: Ok(None).
-/// - Agents configured → every request must present a valid X-Ghpool-Key;
+/// - Agents configured → every request must present a valid X-Octobroker-Key;
 ///   missing or unknown keys get 401 with a JSON-RPC error body.
 pub(crate) fn authenticate<'a>(
     state: &'a AppState,
@@ -1633,17 +1633,17 @@ pub(crate) fn authenticate<'a>(
     if agents.is_empty() {
         return Ok(None);
     }
-    let Some(presented) = headers.get("x-ghpool-key").and_then(|v| v.to_str().ok()) else {
-        tracing::warn!("MCP request rejected: missing X-Ghpool-Key");
-        return Err(Box::new(rpc_error(StatusCode::UNAUTHORIZED, "X-Ghpool-Key header required")));
+    let Some(presented) = headers.get("x-octobroker-key").and_then(|v| v.to_str().ok()) else {
+        tracing::warn!("MCP request rejected: missing X-Octobroker-Key");
+        return Err(Box::new(rpc_error(StatusCode::UNAUTHORIZED, "X-Octobroker-Key header required")));
     };
     for agent in agents {
         if agent.keys.iter().any(|k| keys_match(k, presented)) {
             return Ok(Some(agent));
         }
     }
-    tracing::warn!("MCP request rejected: invalid X-Ghpool-Key");
-    Err(Box::new(rpc_error(StatusCode::UNAUTHORIZED, "invalid X-Ghpool-Key")))
+    tracing::warn!("MCP request rejected: invalid X-Octobroker-Key");
+    Err(Box::new(rpc_error(StatusCode::UNAUTHORIZED, "invalid X-Octobroker-Key")))
 }
 
 /// Compare keys via SHA-256 digests. Comparing fixed-length digests of both
@@ -1699,7 +1699,7 @@ fn build_upstream_headers(
     h.insert("authorization", format!("Bearer {}", token).parse().ok()?);
     h.insert(
         "user-agent",
-        concat!("ghpool/", env!("CARGO_PKG_VERSION")).parse().expect("static ua header"),
+        concat!("octobroker/", env!("CARGO_PKG_VERSION")).parse().expect("static ua header"),
     );
     for name in FWD_HEADERS {
         if let Some(v) = client.get(*name) {
@@ -1942,7 +1942,7 @@ data: "id":1,"result":{"tools":[]}}
 
     #[test]
     fn test_parse_frame_tools_call() {
-        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_issue","arguments":{"owner":"openabdev","repo":"ghpool"}}}"#;
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_issue","arguments":{"owner":"openabdev","repo":"octobroker"}}}"#;
         let f = parse_frame(body).unwrap();
         assert_eq!(f.method, "tools/call");
         assert_eq!(f.tool.as_deref(), Some("get_issue"));
@@ -2055,7 +2055,7 @@ data: "id":1,"result":{"tools":[]}}
         auth: Option<String>,
         toolsets: Option<String>,
         tools_hdr: Option<String>,
-        ghpool_key: Option<String>,
+        octobroker_key: Option<String>,
         session: Option<String>,
         body: String,
     }
@@ -2081,7 +2081,7 @@ data: "id":1,"result":{"tools":[]}}
             auth: get("authorization"),
             toolsets: get("x-mcp-toolsets"),
             tools_hdr: get("x-mcp-tools"),
-            ghpool_key: get("x-ghpool-key"),
+            octobroker_key: get("x-octobroker-key"),
             session: get("mcp-session-id"),
             body: body_str.clone(),
         });
@@ -2368,7 +2368,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-                &[("x-ghpool-key", "wrong-key")],
+                &[("x-octobroker-key", "wrong-key")],
             ))
             .await
             .unwrap();
@@ -2386,7 +2386,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{}}}"#,
-                &[("x-ghpool-key", "key-a")],
+                &[("x-octobroker-key", "key-a")],
             ))
             .await
             .unwrap();
@@ -2398,8 +2398,8 @@ data: "id":1,"result":{"tools":[]}}
         assert_eq!(reqs[0].tools_hdr.as_deref(), Some("issue_read,get_file_contents"));
         // agent mode: global toolsets NOT injected
         assert!(reqs[0].toolsets.is_none());
-        // the ghpool key itself never goes upstream
-        assert!(reqs[0].ghpool_key.is_none());
+        // the octobroker key itself never goes upstream
+        assert!(reqs[0].octobroker_key.is_none());
         // pooled token injected as usual
         assert_eq!(reqs[0].auth.as_deref(), Some("Bearer token-alice"));
     }
@@ -2414,7 +2414,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_file_contents","arguments":{}}}"#,
-                &[("x-ghpool-key", "key-a")],
+                &[("x-octobroker-key", "key-a")],
             ))
             .await
             .unwrap();
@@ -2434,7 +2434,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{}}}"#,
-                &[("x-ghpool-key", "key-a")],
+                &[("x-octobroker-key", "key-a")],
             ))
             .await
             .unwrap();
@@ -2453,7 +2453,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#,
-                &[("x-ghpool-key", "key-a")],
+                &[("x-octobroker-key", "key-a")],
             ))
             .await
             .unwrap();
@@ -2461,7 +2461,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-                &[("x-ghpool-key", "key-a"), ("mcp-session-id", "mock-sess-1")],
+                &[("x-octobroker-key", "key-a"), ("mcp-session-id", "mock-sess-1")],
             ))
             .await
             .unwrap();
@@ -2483,7 +2483,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_issues","arguments":{}}}"#,
-                &[("x-ghpool-key", "key-b")],
+                &[("x-octobroker-key", "key-b")],
             ))
             .await
             .unwrap();
@@ -2496,7 +2496,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_issues","arguments":{}}}"#,
-                &[("x-ghpool-key", "key-a")],
+                &[("x-octobroker-key", "key-a")],
             ))
             .await
             .unwrap();
@@ -2520,7 +2520,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":0,"method":"initialize"}"#,
-                &[("x-ghpool-key", "key-a")],
+                &[("x-octobroker-key", "key-a")],
             ))
             .await
             .unwrap();
@@ -2534,7 +2534,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{}}}"#,
-                &[("x-ghpool-key", "key-b"), ("mcp-session-id", "mock-sess-1")],
+                &[("x-octobroker-key", "key-b"), ("mcp-session-id", "mock-sess-1")],
             ))
             .await
             .unwrap();
@@ -2546,7 +2546,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"issue_read","arguments":{}}}"#,
-                &[("x-ghpool-key", "key-a"), ("mcp-session-id", "mock-sess-1")],
+                &[("x-octobroker-key", "key-a"), ("mcp-session-id", "mock-sess-1")],
             ))
             .await
             .unwrap();
@@ -2567,7 +2567,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-                &[("x-ghpool-key", "key-a"), ("mcp-session-id", "old-sess")],
+                &[("x-octobroker-key", "key-a"), ("mcp-session-id", "old-sess")],
             ))
             .await
             .unwrap();
@@ -2585,7 +2585,7 @@ data: "id":1,"result":{"tools":[]}}
             let resp = mcp_app(state.clone())
                 .oneshot(post_frame(
                     r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-                    &[("x-ghpool-key", key)],
+                    &[("x-octobroker-key", key)],
                 ))
                 .await
                 .unwrap();
@@ -2597,7 +2597,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"not_allowed","arguments":{}}}"#,
-                &[("x-ghpool-key", "new-key")],
+                &[("x-octobroker-key", "new-key")],
             ))
             .await
             .unwrap();
@@ -2628,8 +2628,8 @@ data: "id":1,"result":{"tools":[]}}
         );
         let resp = mcp_app(state)
             .oneshot(post_frame(
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"ghpool","title":"x"}}}"#,
-                &[("x-ghpool-key", "key-a")],
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"octobroker","title":"x"}}}"#,
+                &[("x-octobroker-key", "key-a")],
             ))
             .await
             .unwrap();
@@ -2645,12 +2645,12 @@ data: "id":1,"result":{"tools":[]}}
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
             &["alice"], &url, &[],
-            vec![agent_with_repos("bot-a", "key-a", &["issue_read"], &["openabdev/ghpool"])],
+            vec![agent_with_repos("bot-a", "key-a", &["issue_read"], &["openabdev/octobroker"])],
         );
         let resp = mcp_app(state)
             .oneshot(post_frame(
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"ghpool","issue_number":15}}}"#,
-                &[("x-ghpool-key", "key-a")],
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"octobroker","issue_number":15}}}"#,
+                &[("x-octobroker-key", "key-a")],
             ))
             .await
             .unwrap();
@@ -2663,12 +2663,12 @@ data: "id":1,"result":{"tools":[]}}
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(
             &["alice"], &url, &[],
-            vec![agent_with_repos("bot-a", "key-a", &["issue_read"], &["openabdev/ghpool"])],
+            vec![agent_with_repos("bot-a", "key-a", &["issue_read"], &["openabdev/octobroker"])],
         );
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"openab","issue_number":1}}}"#,
-                &[("x-ghpool-key", "key-a")],
+                &[("x-octobroker-key", "key-a")],
             ))
             .await
             .unwrap();
@@ -2687,7 +2687,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"foo"}}}"#,
-                &[("x-ghpool-key", "key-a")],
+                &[("x-octobroker-key", "key-a")],
             ))
             .await
             .unwrap();
@@ -2708,7 +2708,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"anything","issue_number":1}}}"#,
-                &[("x-ghpool-key", "key-a")],
+                &[("x-octobroker-key", "key-a")],
             ))
             .await
             .unwrap();
@@ -2727,7 +2727,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"foo"}}}"#,
-                &[("x-ghpool-key", "key-a")],
+                &[("x-octobroker-key", "key-a")],
             ))
             .await
             .unwrap();
@@ -2738,7 +2738,7 @@ data: "id":1,"result":{"tools":[]}}
     #[tokio::test]
     async fn test_phase1_mode_unaffected_by_write_classification() {
         // No agents → Phase 1 network-trust mode: the readonly upstream is
-        // the write barrier; ghpool does not block (backward compatible).
+        // the write barrier; octobroker does not block (backward compatible).
         let (url, captured) = spawn_mock_upstream().await;
         let state = test_state_full(&["alice"], &url, &[], vec![]);
         let resp = mcp_app(state)
@@ -2752,7 +2752,7 @@ data: "id":1,"result":{"tools":[]}}
         assert_eq!(captured.lock().unwrap().len(), 1);
     }
 
-    // ---- ghpool-owned tool: handler-level tests (mock GraphQL) ----
+    // ---- octobroker-owned tool: handler-level tests (mock GraphQL) ----
 
     /// Mock api.github.com/graphql: VerifyComment queries answer with the
     /// given author/repo (viewer is always the App bot identity, with the
@@ -2785,7 +2785,7 @@ data: "id":1,"result":{"tools":[]}}
                 }
                 Json(serde_json::json!({
                     "data": {
-                        "viewer": {"login": "oab-ghpool[bot]"},
+                        "viewer": {"login": "oab-octobroker[bot]"},
                         "node": {
                             "author": {"login": author_login},
                             "issue": {"repository": {"nameWithOwner": node_repo}}
@@ -2824,12 +2824,12 @@ data: "id":1,"result":{"tools":[]}}
 
     #[tokio::test]
     async fn test_minimize_accepts_app_bot_authored_comment() {
-        // The live API returns viewer "oab-ghpool[bot]" but Bot comment
-        // authors carry the bare "oab-ghpool" login — the ownership check
+        // The live API returns viewer "oab-octobroker[bot]" but Bot comment
+        // authors carry the bare "oab-octobroker" login — the ownership check
         // must accept the App's own comments (empirically verified shape).
-        let (gql, mutations) = spawn_mock_graphql("oab-ghpool", "openabdev/ghpool", false).await;
+        let (gql, mutations) = spawn_mock_graphql("oab-octobroker", "openabdev/octobroker", false).await;
         let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
-        let frame = minimize_frame("openabdev", "ghpool", "OUTDATED");
+        let frame = minimize_frame("openabdev", "octobroker", "OUTDATED");
         let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
         assert_eq!(out.http_status, 200);
         assert_eq!(out.tool_error, Some(false));
@@ -2841,9 +2841,9 @@ data: "id":1,"result":{"tools":[]}}
 
     #[tokio::test]
     async fn test_minimize_rejects_human_authored_comment() {
-        let (gql, mutations) = spawn_mock_graphql("chaodu-agent", "openabdev/ghpool", false).await;
+        let (gql, mutations) = spawn_mock_graphql("chaodu-agent", "openabdev/octobroker", false).await;
         let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
-        let frame = minimize_frame("openabdev", "ghpool", "OUTDATED");
+        let frame = minimize_frame("openabdev", "octobroker", "OUTDATED");
         let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
         assert_eq!(out.tool_error, Some(true));
         assert!(mutations.lock().unwrap().is_empty(), "no mutation for foreign authors");
@@ -2853,9 +2853,9 @@ data: "id":1,"result":{"tools":[]}}
     async fn test_minimize_rejects_repo_mismatch() {
         // node_id belongs to another repository than the policy-checked
         // owner/repo arguments — must be refused before the mutation.
-        let (gql, mutations) = spawn_mock_graphql("oab-ghpool", "openabdev/other-repo", false).await;
+        let (gql, mutations) = spawn_mock_graphql("oab-octobroker", "openabdev/other-repo", false).await;
         let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
-        let frame = minimize_frame("openabdev", "ghpool", "OUTDATED");
+        let frame = minimize_frame("openabdev", "octobroker", "OUTDATED");
         let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
         assert_eq!(out.http_status, StatusCode::FORBIDDEN.as_u16());
         assert_eq!(out.tool_error, Some(true));
@@ -2865,15 +2865,15 @@ data: "id":1,"result":{"tools":[]}}
     #[tokio::test]
     async fn test_minimize_rejects_graphql_errors_and_bad_classifier() {
         // GraphQL soft errors (HTTP 200 + errors[]) fail closed.
-        let (gql, mutations) = spawn_mock_graphql("oab-ghpool", "openabdev/ghpool", true).await;
+        let (gql, mutations) = spawn_mock_graphql("oab-octobroker", "openabdev/octobroker", true).await;
         let state = test_state_full(&["alice"], "http://unused", &[], vec![]);
-        let frame = minimize_frame("openabdev", "ghpool", "OUTDATED");
+        let frame = minimize_frame("openabdev", "octobroker", "OUTDATED");
         let out = handle_minimize_comment(&state, &app_cred(), &frame, &gql).await;
         assert_eq!(out.tool_error, Some(true));
         assert!(mutations.lock().unwrap().is_empty());
 
         // Unknown classifier is rejected before any network call.
-        let frame = minimize_frame("openabdev", "ghpool", "WRONG");
+        let frame = minimize_frame("openabdev", "octobroker", "WRONG");
         let out = handle_minimize_comment(&state, &app_cred(), &frame, "http://127.0.0.1:1/").await;
         assert_eq!(out.tool_error, Some(true));
     }
@@ -2886,7 +2886,7 @@ data: "id":1,"result":{"tools":[]}}
         let state = test_state_full(&["alice"], &url, &[], vec![]);
         let resp = mcp_app(state)
             .oneshot(post_frame(
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ghpool_review_minimize_comment","arguments":{"owner":"openabdev","repo":"ghpool","node_id":"MDU6SXNzdWUx","classifier":"OUTDATED"}}}"#,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"octobroker_review_minimize_comment","arguments":{"owner":"openabdev","repo":"octobroker","node_id":"MDU6SXNzdWUx","classifier":"OUTDATED"}}}"#,
                 &[],
             ))
             .await
@@ -3056,7 +3056,7 @@ data: "id":1,"result":{"tools":[]}}
 
     fn audit_tmp(name: &str) -> String {
         std::env::temp_dir()
-            .join(format!("ghpool-mcp-audit-{}-{}.jsonl", name, std::process::id()))
+            .join(format!("octobroker-mcp-audit-{}-{}.jsonl", name, std::process::id()))
             .to_str().unwrap().to_string()
     }
 
@@ -3113,7 +3113,7 @@ data: "id":1,"result":{"tools":[]}}
 
         let resp = mcp_app(state)
             .oneshot(post_frame(
-                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"ghpool","title":"secret title"}}}"#,
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"octobroker","title":"secret title"}}}"#,
                 &[],
             ))
             .await
@@ -3127,7 +3127,7 @@ data: "id":1,"result":{"tools":[]}}
         assert_eq!(records.len(), 2);
         assert_eq!(records[0]["phase"], "request");
         assert_eq!(records[0]["tool"], "create_issue");
-        assert_eq!(records[0]["repo"], "openabdev/ghpool");
+        assert_eq!(records[0]["repo"], "openabdev/octobroker");
         assert_eq!(records[0]["rpc_id"], 7);
         // argument VALUES never recorded
         assert!(!records[0].to_string().contains("secret title"));
@@ -3233,13 +3233,13 @@ data: "id":1,"result":{"tools":[]}}
     #[test]
     fn test_scope_envelope() {
         // exact entries, single owner → repo names
-        let a = agent_with_repos("a", "k", &[], &["openabdev/ghpool", "openabdev/openab"]);
-        assert_eq!(scope_envelope(Some(&a)), vec!["ghpool", "openab"]);
+        let a = agent_with_repos("a", "k", &[], &["openabdev/octobroker", "openabdev/openab"]);
+        assert_eq!(scope_envelope(Some(&a)), vec!["octobroker", "openab"]);
         // wildcard → installation-wide
         let a = agent_with_repos("a", "k", &[], &["openabdev/*"]);
         assert!(scope_envelope(Some(&a)).is_empty());
         // mixed owners → installation-wide
-        let a = agent_with_repos("a", "k", &[], &["openabdev/ghpool", "oablab/chi"]);
+        let a = agent_with_repos("a", "k", &[], &["openabdev/octobroker", "oablab/chi"]);
         assert!(scope_envelope(Some(&a)).is_empty());
         // no restriction → installation-wide
         let a = agent("a", "k", &[]);
@@ -3294,14 +3294,14 @@ data: "id":1,"result":{"tools":[]}}
         let sink = crate::audit::AuditSink::open(&path).unwrap();
         let state = test_state_writes_enabled(
             &url, sink,
-            vec![agent_with_repos("bot-w", "key-w", &["create_issue"], &["openabdev/ghpool"])],
+            vec![agent_with_repos("bot-w", "key-w", &["create_issue"], &["openabdev/octobroker"])],
             4,
         );
 
         let resp = mcp_app(state)
             .oneshot(post_frame(
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"ghpool","title":"t"}}}"#,
-                &[("x-ghpool-key", "key-w")],
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"octobroker","title":"t"}}}"#,
+                &[("x-octobroker-key", "key-w")],
             ))
             .await
             .unwrap();
@@ -3326,14 +3326,14 @@ data: "id":1,"result":{"tools":[]}}
         let sink = crate::audit::AuditSink::open(&path).unwrap();
         let state = test_state_writes_enabled(
             &url, sink,
-            vec![agent_with_repos("bot-w", "key-w", &["create_issue"], &["openabdev/ghpool"])],
+            vec![agent_with_repos("bot-w", "key-w", &["create_issue"], &["openabdev/octobroker"])],
             4,
         );
         // wrong repo → 403 even with writes enabled
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"evil","repo":"other","title":"t"}}}"#,
-                &[("x-ghpool-key", "key-w")],
+                &[("x-octobroker-key", "key-w")],
             ))
             .await
             .unwrap();
@@ -3341,8 +3341,8 @@ data: "id":1,"result":{"tools":[]}}
         // tool off allowlist → 403
         let resp = mcp_app(state)
             .oneshot(post_frame(
-                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_file","arguments":{"owner":"openabdev","repo":"ghpool"}}}"#,
-                &[("x-ghpool-key", "key-w")],
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_file","arguments":{"owner":"openabdev","repo":"octobroker"}}}"#,
+                &[("x-octobroker-key", "key-w")],
             ))
             .await
             .unwrap();
@@ -3380,15 +3380,15 @@ data: "id":1,"result":{"tools":[]}}
         let sink = crate::audit::AuditSink::open(&path).unwrap();
         let state = test_state_writes_enabled(
             &url, sink,
-            vec![agent_with_repos("bot-w", "key-w", &["create_issue"], &["openabdev/ghpool"])],
+            vec![agent_with_repos("bot-w", "key-w", &["create_issue"], &["openabdev/octobroker"])],
             1,
         );
         // Saturate the cap by holding a guard, then issue a write
         let _held = InFlightGuard::try_acquire(&state.write_inflight, "bot-w", 1).unwrap();
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
-                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"ghpool","title":"t"}}}"#,
-                &[("x-ghpool-key", "key-w")],
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"octobroker","title":"t"}}}"#,
+                &[("x-octobroker-key", "key-w")],
             ))
             .await
             .unwrap();
@@ -3442,7 +3442,7 @@ data: "id":1,"result":{"tools":[]}}
             auth: auth.clone(),
             toolsets: get("x-mcp-toolsets"),
             tools_hdr: get("x-mcp-tools"),
-            ghpool_key: get("x-ghpool-key"),
+            octobroker_key: get("x-octobroker-key"),
             session: session.clone(),
             body: body_str.clone(),
         });
@@ -3591,10 +3591,10 @@ data: "id":1,"result":{"tools":[]}}
     fn test_route_owners_and_owner_envelope() {
         let a = agent_with_repos(
             "a", "k", &[],
-            &["openabdev/openab", "OABLAB/chi", "openabdev/ghpool"],
+            &["openabdev/openab", "OABLAB/chi", "openabdev/octobroker"],
         );
         assert_eq!(route_owners(&a), vec!["oablab", "openabdev"]);
-        assert_eq!(scope_envelope_for_owner(&a, "openabdev"), vec!["openab", "ghpool"]);
+        assert_eq!(scope_envelope_for_owner(&a, "openabdev"), vec!["openab", "octobroker"]);
         assert_eq!(scope_envelope_for_owner(&a, "oablab"), vec!["chi"]);
         assert!(scope_envelope_for_owner(&a, "other").is_empty());
         // wildcard for the owner → installation-wide
@@ -3610,7 +3610,7 @@ data: "id":1,"result":{"tools":[]}}
         let (url, captured) = spawn_mock_upstream_multi().await;
         let state = test_state_multi(&url, false, None).await;
         let resp = mcp_app(state.clone())
-            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b0")]))
+            .oneshot(post_frame(MULTI_INIT, &[("x-octobroker-key", "key-b0")]))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3655,7 +3655,7 @@ data: "id":1,"result":{"tools":[]}}
         let (url, captured) = spawn_mock_upstream_multi().await;
         let state = test_state_multi(&url, false, None).await;
         mcp_app(state.clone())
-            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b0")]))
+            .oneshot(post_frame(MULTI_INIT, &[("x-octobroker-key", "key-b0")]))
             .await
             .unwrap();
         captured.lock().unwrap().clear();
@@ -3665,7 +3665,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"openab","issue_number":1}}}"#,
-                &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
+                &[("x-octobroker-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
             ))
             .await
             .unwrap();
@@ -3676,7 +3676,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"oablab","repo":"chi","issue_number":2}}}"#,
-                &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
+                &[("x-octobroker-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
             ))
             .await
             .unwrap();
@@ -3696,7 +3696,7 @@ data: "id":1,"result":{"tools":[]}}
         let (url, captured) = spawn_mock_upstream_multi().await;
         let state = test_state_multi(&url, false, None).await;
         mcp_app(state.clone())
-            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b0")]))
+            .oneshot(post_frame(MULTI_INIT, &[("x-octobroker-key", "key-b0")]))
             .await
             .unwrap();
         captured.lock().unwrap().clear();
@@ -3704,7 +3704,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"evil","repo":"repo","issue_number":1}}}"#,
-                &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
+                &[("x-octobroker-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
             ))
             .await
             .unwrap();
@@ -3719,7 +3719,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"openab","issue_number":1}}}"#,
-                &[("x-ghpool-key", "key-b0")],
+                &[("x-octobroker-key", "key-b0")],
             ))
             .await
             .unwrap();
@@ -3768,7 +3768,7 @@ data: "id":1,"result":{"tools":[]}}
                 // Call the LIVE route (oablab): routes are minted together,
                 // so ANY expired route terminates the session as a whole.
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"oablab","repo":"chi","issue_number":1}}}"#,
-                &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "dsid")],
+                &[("x-octobroker-key", "key-b0"), ("mcp-session-id", "dsid")],
             ))
             .await
             .unwrap();
@@ -3787,7 +3787,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"tag":"fail_secondary"}}"#,
-                &[("x-ghpool-key", "key-b0")],
+                &[("x-octobroker-key", "key-b0")],
             ))
             .await
             .unwrap();
@@ -3823,7 +3823,7 @@ data: "id":1,"result":{"tools":[]}}
         let (url, captured) = spawn_mock_upstream_multi().await;
         let state = test_state_multi(&url, false, None).await;
         mcp_app(state.clone())
-            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b0")]))
+            .oneshot(post_frame(MULTI_INIT, &[("x-octobroker-key", "key-b0")]))
             .await
             .unwrap();
         captured.lock().unwrap().clear();
@@ -3831,7 +3831,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-                &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
+                &[("x-octobroker-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
             ))
             .await
             .unwrap();
@@ -3864,7 +3864,7 @@ data: "id":1,"result":{"tools":[]}}
         let (url, captured) = spawn_mock_upstream_multi().await;
         let state = test_state_multi(&url, false, None).await;
         mcp_app(state.clone())
-            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b0")]))
+            .oneshot(post_frame(MULTI_INIT, &[("x-octobroker-key", "key-b0")]))
             .await
             .unwrap();
         captured.lock().unwrap().clear();
@@ -3874,7 +3874,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state.clone())
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"openabdev","repo":"openab","issue_number":1}}}"#,
-                &[("x-ghpool-key", "key-intruder"), ("mcp-session-id", "sess-ghs_oablab")],
+                &[("x-octobroker-key", "key-intruder"), ("mcp-session-id", "sess-ghs_oablab")],
             ))
             .await
             .unwrap();
@@ -3885,7 +3885,7 @@ data: "id":1,"result":{"tools":[]}}
         let req = Request::builder()
             .method("DELETE")
             .uri("/mcp")
-            .header("x-ghpool-key", "key-intruder")
+            .header("x-octobroker-key", "key-intruder")
             .header("mcp-session-id", "sess-ghs_oablab")
             .body(Body::empty())
             .unwrap();
@@ -3898,7 +3898,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"issue_read","arguments":{"owner":"oablab","repo":"chi","issue_number":2}}}"#,
-                &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
+                &[("x-octobroker-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
             ))
             .await
             .unwrap();
@@ -3910,7 +3910,7 @@ data: "id":1,"result":{"tools":[]}}
         let (url, captured) = spawn_mock_upstream_multi().await;
         let state = test_state_multi(&url, false, None).await;
         mcp_app(state.clone())
-            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b0")]))
+            .oneshot(post_frame(MULTI_INIT, &[("x-octobroker-key", "key-b0")]))
             .await
             .unwrap();
         captured.lock().unwrap().clear();
@@ -3918,7 +3918,7 @@ data: "id":1,"result":{"tools":[]}}
         let req = Request::builder()
             .method("DELETE")
             .uri("/mcp")
-            .header("x-ghpool-key", "key-b0")
+            .header("x-octobroker-key", "key-b0")
             .header("mcp-session-id", "sess-ghs_oablab")
             .body(Body::empty())
             .unwrap();
@@ -3952,7 +3952,7 @@ data: "id":1,"result":{"tools":[]}}
         // initialize as the repo-less agent: NO fan-out — single upstream
         // request, served by the pooled PAT, pinned normally
         let resp = mcp_app(state.clone())
-            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b2pat")]))
+            .oneshot(post_frame(MULTI_INIT, &[("x-octobroker-key", "key-b2pat")]))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -3971,7 +3971,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"foo"}}}"#,
-                &[("x-ghpool-key", "key-b2pat"), ("mcp-session-id", "sess-token-alice")],
+                &[("x-octobroker-key", "key-b2pat"), ("mcp-session-id", "sess-token-alice")],
             ))
             .await
             .unwrap();
@@ -3989,7 +3989,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"openab","title":"t"}}}"#,
-                &[("x-ghpool-key", "key-b2pat")],
+                &[("x-octobroker-key", "key-b2pat")],
             ))
             .await
             .unwrap();
@@ -4009,7 +4009,7 @@ data: "id":1,"result":{"tools":[]}}
         let sink = crate::audit::AuditSink::open(&path).unwrap();
         let state = test_state_multi(&url, true, Some(sink)).await;
         mcp_app(state.clone())
-            .oneshot(post_frame(MULTI_INIT, &[("x-ghpool-key", "key-b0")]))
+            .oneshot(post_frame(MULTI_INIT, &[("x-octobroker-key", "key-b0")]))
             .await
             .unwrap();
         captured.lock().unwrap().clear();
@@ -4017,7 +4017,7 @@ data: "id":1,"result":{"tools":[]}}
         let resp = mcp_app(state)
             .oneshot(post_frame(
                 r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"openab","title":"t"}}}"#,
-                &[("x-ghpool-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
+                &[("x-octobroker-key", "key-b0"), ("mcp-session-id", "sess-ghs_oablab")],
             ))
             .await
             .unwrap();

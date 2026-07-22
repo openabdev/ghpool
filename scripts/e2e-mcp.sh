@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# E2E test: ghpool MCP reverse proxy against GitHub's hosted MCP server.
+# E2E test: octobroker MCP reverse proxy against GitHub's hosted MCP server.
 #
 # Requires:
 #   GITHUB_TOKEN  — a user token (PAT or `gh auth token`); the Actions built-in
 #                   installation token is NOT accepted by the hosted MCP server.
-#   GHPOOL_BIN    — path to the ghpool binary (default: ./target/debug/ghpool)
+#   OCTOBROKER_BIN    — path to the octobroker binary (default: ./target/debug/octobroker)
 #   jq, python3
 #
 # Usage: GITHUB_TOKEN=$(gh auth token) ./scripts/e2e-mcp.sh
@@ -13,10 +13,10 @@
 # exits non-zero at the end if any failed. Hard setup errors abort explicitly.
 set -uo pipefail
 
-BIN="${GHPOOL_BIN:-./target/debug/ghpool}"
+BIN="${OCTOBROKER_BIN:-./target/debug/octobroker}"
 WORKDIR="$(mktemp -d)"
-LOG="${WORKDIR}/ghpool.log"
-# --max-time must exceed ghpool's upstream POST timeout (120s) so a slow but
+LOG="${WORKDIR}/octobroker.log"
+# --max-time must exceed octobroker's upstream POST timeout (120s) so a slow but
 # healthy upstream call is not cut off client-side.
 CURL=(curl -s --connect-timeout 5 --max-time 130)
 
@@ -33,10 +33,10 @@ check() {
 }
 
 cleanup() {
-  [ -n "${GHPOOL_PID:-}" ] && kill "${GHPOOL_PID}" 2>/dev/null
+  [ -n "${OCTOBROKER_PID:-}" ] && kill "${OCTOBROKER_PID}" 2>/dev/null
   # Preserve the server logs for CI artifact upload on failure
-  [ "${fail:-1}" -gt 0 ] && [ -f "${LOG}" ] && cp "${LOG}" ./ghpool-e2e.log 2>/dev/null
-  [ "${fail:-1}" -gt 0 ] && [ -f "${WORKDIR}/ghpool-app.log" ] && cp "${WORKDIR}/ghpool-app.log" ./ghpool-e2e-app.log 2>/dev/null
+  [ "${fail:-1}" -gt 0 ] && [ -f "${LOG}" ] && cp "${LOG}" ./octobroker-e2e.log 2>/dev/null
+  [ "${fail:-1}" -gt 0 ] && [ -f "${WORKDIR}/octobroker-app.log" ] && cp "${WORKDIR}/octobroker-app.log" ./octobroker-e2e-app.log 2>/dev/null
   rm -rf "${WORKDIR}"
 }
 trap cleanup EXIT
@@ -48,7 +48,7 @@ fi
 
 # Pick a free port to avoid CI collisions
 PORT="${PORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')}"
-# Bind and connect over IPv4 explicitly: ghpool binds 0.0.0.0, but "localhost"
+# Bind and connect over IPv4 explicitly: octobroker binds 0.0.0.0, but "localhost"
 # can resolve to ::1 on dual-stack hosts and fail to connect.
 BASE="http://127.0.0.1:${PORT}"
 
@@ -62,15 +62,15 @@ token = "env:GITHUB_TOKEN"
 enabled = true
 EOF
 
-echo "starting ghpool (${BIN}) on :${PORT}"
-GHPOOL_CONFIG="${WORKDIR}/config.toml" "${BIN}" > "${LOG}" 2>&1 &
-GHPOOL_PID=$!
+echo "starting octobroker (${BIN}) on :${PORT}"
+OCTOBROKER_CONFIG="${WORKDIR}/config.toml" "${BIN}" > "${LOG}" 2>&1 &
+OCTOBROKER_PID=$!
 
 for _ in $(seq 1 20); do
   "${CURL[@]}" -f "${BASE}/healthz" > /dev/null 2>&1 && break
   sleep 0.5
 done
-"${CURL[@]}" -f "${BASE}/healthz" > /dev/null || { echo "ghpool failed to start"; cat "${LOG}"; exit 1; }
+"${CURL[@]}" -f "${BASE}/healthz" > /dev/null || { echo "octobroker failed to start"; cat "${LOG}"; exit 1; }
 
 JSON_H=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
 
@@ -92,7 +92,7 @@ jq_ok() { jq -e "$1" "$2" > /dev/null 2>&1; }
 echo "1. initialize (no client Authorization header)"
 "${CURL[@]}" -D "${WORKDIR}/init-headers.txt" -o "${WORKDIR}/init-body.txt" \
   -X POST "${BASE}/mcp" "${JSON_H[@]}" \
-  -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ghpool-e2e","version":"0"}}}'
+  -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"octobroker-e2e","version":"0"}}}'
 check "initialize returns 200" grep -q "^HTTP/1.1 200" "${WORKDIR}/init-headers.txt"
 SID="$(grep -i "^mcp-session-id:" "${WORKDIR}/init-headers.txt" | tr -d '\r' | awk '{print $2}')"
 check "Mcp-Session-Id returned" test -n "${SID}"
@@ -120,9 +120,9 @@ check "read tool present (issue_read)" \
 check "no write tools listed — readonly enforced" \
   jq_ok '[.result.tools[].name | select(test("^(create_|update_|delete_|add_)"))] | length == 0' "${WORKDIR}/tools.json"
 
-echo "4. tools/call issue_read on openabdev/ghpool#15"
+echo "4. tools/call issue_read on openabdev/octobroker#15"
 "${CURL[@]}" -X POST "${BASE}/mcp" "${JSON_H[@]}" "${SESS_H[@]}" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"issue_read","arguments":{"method":"get","owner":"openabdev","repo":"ghpool","issue_number":15}}}' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"issue_read","arguments":{"method":"get","owner":"openabdev","repo":"octobroker","issue_number":15}}}' \
   -o "${WORKDIR}/issue-raw.txt"
 sse_json "${WORKDIR}/issue-raw.txt" > "${WORKDIR}/issue.json"
 check "issue_read returned issue #15" \
@@ -130,7 +130,7 @@ check "issue_read returned issue #15" \
 
 echo "5. negative: write tool call is rejected"
 "${CURL[@]}" -X POST "${BASE}/mcp" "${JSON_H[@]}" "${SESS_H[@]}" \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"ghpool","title":"e2e-must-not-exist"}}}' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_issue","arguments":{"owner":"openabdev","repo":"octobroker","title":"e2e-must-not-exist"}}}' \
   -o "${WORKDIR}/write-raw.txt"
 sse_json "${WORKDIR}/write-raw.txt" > "${WORKDIR}/write.json"
 check "create_issue rejected (error or unknown tool)" \
@@ -156,10 +156,10 @@ check "tools/call audit-logged" grep -q "MCP tools/call issue_read" "${LOG}"
 # ── Optional: GitHub App credential backend mode (2b) ────────────────────
 # Runs when App credentials are provided (CI passes the repo secrets).
 if [ -n "${APP_ID:-}" ] && [ -n "${APP_PRIVATE_KEY:-}" ]; then
-  echo "9. App-backend mode (ghpool mints installation tokens itself)"
+  echo "9. App-backend mode (octobroker mints installation tokens itself)"
   APP_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
   APP_BASE="http://127.0.0.1:${APP_PORT}"
-  APP_LOG="${WORKDIR}/ghpool-app.log"
+  APP_LOG="${WORKDIR}/octobroker-app.log"
   cat > "${WORKDIR}/config-app.toml" <<EOF
 port = ${APP_PORT}
 allowed_owners = ["openabdev"]
@@ -170,7 +170,7 @@ app_id = "${APP_ID}"
 private_key = "env:APP_PRIVATE_KEY"
 owner = "openabdev"
 EOF
-  GHPOOL_CONFIG="${WORKDIR}/config-app.toml" "${BIN}" > "${APP_LOG}" 2>&1 &
+  OCTOBROKER_CONFIG="${WORKDIR}/config-app.toml" "${BIN}" > "${APP_LOG}" 2>&1 &
   APP_PID=$!
   trap '[ -n "${APP_PID:-}" ] && kill "${APP_PID}" 2>/dev/null; cleanup' EXIT
 
@@ -178,11 +178,11 @@ EOF
     "${CURL[@]}" -f "${APP_BASE}/healthz" > /dev/null 2>&1 && break
     sleep 0.5
   done
-  "${CURL[@]}" -f "${APP_BASE}/healthz" > /dev/null || { echo "app-mode ghpool failed to start"; cat "${APP_LOG}"; exit 1; }
+  "${CURL[@]}" -f "${APP_BASE}/healthz" > /dev/null || { echo "app-mode octobroker failed to start"; cat "${APP_LOG}"; exit 1; }
 
   "${CURL[@]}" -D "${WORKDIR}/app-init-h.txt" -o "${WORKDIR}/app-init-b.txt" \
     -X POST "${APP_BASE}/mcp" "${JSON_H[@]}" \
-    -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ghpool-e2e-app","version":"0"}}}'
+    -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"octobroker-e2e-app","version":"0"}}}'
   check "app-mode initialize returns 200" grep -q "^HTTP/1.1 200" "${WORKDIR}/app-init-h.txt"
   ASID="$(grep -i "^mcp-session-id:" "${WORKDIR}/app-init-h.txt" | tr -d '\r' | awk '{print $2}')"
   check "app-mode session established" test -n "${ASID}"
@@ -190,7 +190,7 @@ EOF
   check "session pinned to App credential" grep -q "MCP session pinned to credential github-app" "${APP_LOG}"
 
   "${CURL[@]}" -X POST "${APP_BASE}/mcp" "${JSON_H[@]}" -H "Mcp-Session-Id: ${ASID}" -H "MCP-Protocol-Version: ${PROTO}" \
-    -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"method":"get","owner":"openabdev","repo":"ghpool","issue_number":15}}}' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"issue_read","arguments":{"method":"get","owner":"openabdev","repo":"octobroker","issue_number":15}}}' \
     -o "${WORKDIR}/app-issue-raw.txt"
   sse_json "${WORKDIR}/app-issue-raw.txt" > "${WORKDIR}/app-issue.json"
   check "app-mode issue_read works" \

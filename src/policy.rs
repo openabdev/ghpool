@@ -118,10 +118,10 @@ mod tests {
 
     #[test]
     fn test_resolve_repo() {
-        let args = serde_json::json!({"owner": "openabdev", "repo": "ghpool", "issue_number": 15});
+        let args = serde_json::json!({"owner": "openabdev", "repo": "octobroker", "issue_number": 15});
         assert_eq!(
             resolve_repo(Some(&args)),
-            Some(("openabdev".to_string(), "ghpool".to_string()))
+            Some(("openabdev".to_string(), "octobroker".to_string()))
         );
 
         // unresolvable shapes
@@ -136,13 +136,13 @@ mod tests {
 
     #[test]
     fn test_repo_allowed_exact_and_wildcard() {
-        let allow = vec!["openabdev/ghpool".to_string(), "oablab/*".to_string()];
-        assert!(repo_allowed(&allow, "openabdev", "ghpool"));
-        assert!(repo_allowed(&allow, "OpenABdev", "GHPool")); // case-insensitive
+        let allow = vec!["openabdev/octobroker".to_string(), "oablab/*".to_string()];
+        assert!(repo_allowed(&allow, "openabdev", "octobroker"));
+        assert!(repo_allowed(&allow, "OpenABdev", "Octobroker")); // case-insensitive
         assert!(repo_allowed(&allow, "oablab", "chi"));
         assert!(repo_allowed(&allow, "oablab", "anything"));
         assert!(!repo_allowed(&allow, "openabdev", "openab"));
-        assert!(!repo_allowed(&allow, "evil", "ghpool"));
+        assert!(!repo_allowed(&allow, "evil", "octobroker"));
     }
 
     #[test]

@@ -199,7 +199,7 @@ mod tests {
 
     fn tmp_path(name: &str) -> String {
         std::env::temp_dir()
-            .join(format!("ghpool-audit-{}-{}.jsonl", name, std::process::id()))
+            .join(format!("octobroker-audit-{}-{}.jsonl", name, std::process::id()))
             .to_str()
             .unwrap()
             .to_string()
@@ -220,7 +220,7 @@ mod tests {
     fn test_records_roundtrip() {
         let path = tmp_path("roundtrip");
         let sink = AuditSink::open(&path).unwrap();
-        let repo = ("openabdev".to_string(), "ghpool".to_string());
+        let repo = ("openabdev".to_string(), "octobroker".to_string());
 
         sink.record_request(&call("create_issue", Some(&repo)), &["owner".into(), "title".into()])
             .unwrap();
@@ -238,7 +238,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["phase"], "request");
         assert_eq!(lines[0]["tool"], "create_issue");
-        assert_eq!(lines[0]["repo"], "openabdev/ghpool");
+        assert_eq!(lines[0]["repo"], "openabdev/octobroker");
         assert_eq!(lines[0]["arg_keys"], serde_json::json!(["owner", "title"]));
         assert_eq!(lines[0]["agent"], "bot-a");
         assert_eq!(lines[1]["phase"], "result");

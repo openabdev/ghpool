@@ -3,36 +3,36 @@ use std::process::{Command, exit};
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
-    let ghpool_url = env::var("GHPOOL_URL")
-        .unwrap_or_else(|_| "http://ghpool.openab.local:8080".to_string());
+    let octobroker_url = env::var("OCTOBROKER_URL")
+        .unwrap_or_else(|_| "http://octobroker.openab.local:8080".to_string());
 
     // Handle version
     if args.first().map(|s| s.as_str()) == Some("version") || args.first().map(|s| s.as_str()) == Some("--version") {
-        println!("ghp version {}", env!("CARGO_PKG_VERSION"));
+        println!("obk version {}", env!("CARGO_PKG_VERSION"));
         let gh = find_real_gh();
         let _ = Command::new(&gh).arg("--version").status();
         exit(0);
     }
 
-    // git credential helper protocol: `ghp git-credential <get|store|erase>`
+    // git credential helper protocol: `obk git-credential <get|store|erase>`
     // Configure as the ONLY helper for github.com (the empty --replace-all
     // entry clears inherited helpers so nothing broader can be consulted):
     //   git config --global --replace-all credential."https://github.com".helper ""
-    //   git config --global --add credential."https://github.com".helper "!ghp git-credential"
+    //   git config --global --add credential."https://github.com".helper "!obk git-credential"
     //   git config --global credential."https://github.com".useHttpPath true
     if args.first().map(|s| s.as_str()) == Some("git-credential") {
-        exit(git_credential(args.get(1).map(|s| s.as_str()), &ghpool_url));
+        exit(git_credential(args.get(1).map(|s| s.as_str()), &octobroker_url));
     }
 
-    // Try to handle as a pooled read via ghpool REST
-    if let Some(code) = try_pooled(&args, &ghpool_url) {
+    // Try to handle as a pooled read via octobroker REST
+    if let Some(code) = try_pooled(&args, &octobroker_url) {
         exit(code);
     }
 
     // Writes / unsupported commands: fall through to real gh
     let gh = find_real_gh();
     let status = Command::new(&gh).args(&args).status().unwrap_or_else(|e| {
-        eprintln!("ghp: failed to exec {}: {}", gh, e);
+        eprintln!("obk: failed to exec {}: {}", gh, e);
         exit(1);
     });
     exit(status.code().unwrap_or(1));
@@ -219,8 +219,8 @@ fn http_get(url: &str) -> Option<String> {
     reqwest::blocking::get(url).ok()?.text().ok()
 }
 
-/// Git credential helper backed by ghpool's /git-credential endpoint:
-/// exchanges GHPOOL_KEY for a short-lived, single-repo GitHub App
+/// Git credential helper backed by octobroker's /git-credential endpoint:
+/// exchanges OCTOBROKER_KEY for a short-lived, single-repo GitHub App
 /// installation token. Only the `get` operation does anything; `store`
 /// and `erase` are no-ops (tokens are ephemeral, nothing to persist).
 ///
@@ -231,7 +231,7 @@ fn git_credential(op: Option<&str>, base: &str) -> i32 {
         Some("get") => {}
         Some("store") | Some("erase") => return 0,
         _ => {
-            eprintln!("usage: ghp git-credential <get|store|erase>");
+            eprintln!("usage: obk git-credential <get|store|erase>");
             return 1;
         }
     }
@@ -240,7 +240,7 @@ fn git_credential(op: Option<&str>, base: &str) -> i32 {
     if std::io::stdin().read_to_string(&mut input).is_err() {
         return 1;
     }
-    match credential_plan(&input, env::var("GHPOOL_KEY").ok()) {
+    match credential_plan(&input, env::var("OCTOBROKER_KEY").ok()) {
         CredentialPlan::Decline => 1,
         CredentialPlan::Quit => credential_quit(),
         CredentialPlan::Fetch { repo, key } => match fetch_git_credential(base, &repo, &key) {
@@ -265,11 +265,11 @@ enum CredentialPlan {
     Decline,
     /// Recognized github.com request that cannot be served. The caller emits
     /// `quit=true` so git stops the helper cascade instead of falling
-    /// through to osxkeychain/GCM/gh auth — that would bypass ghpool repo
+    /// through to osxkeychain/GCM/gh auth — that would bypass octobroker repo
     /// policy and audit.
     Quit,
-    /// Recognized and serviceable: exchange GHPOOL_KEY for a short-lived
-    /// single-repo token via ghpool.
+    /// Recognized and serviceable: exchange OCTOBROKER_KEY for a short-lived
+    /// single-repo token via octobroker.
     Fetch { repo: String, key: String },
 }
 
@@ -314,7 +314,7 @@ fn fetch_git_credential(base: &str, repo: &str, key: &str) -> Option<(String, St
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get(&url)
-        .header("X-Ghpool-Key", key)
+        .header("X-Octobroker-Key", key)
         .timeout(std::time::Duration::from_secs(15))
         .send()
         .ok()?;
@@ -352,7 +352,7 @@ fn parse_credential_input(input: &str) -> std::collections::HashMap<String, Stri
 /// extra segments (`owner/repo/info/refs` → `owner/repo`). Both components
 /// must match GitHub's identifier charset — anything else (percent-encoding,
 /// whitespace, control chars, unicode) is refused so the value is provably
-/// safe to interpolate into the ghpool query string.
+/// safe to interpolate into the octobroker query string.
 fn repo_from_path(path: &str) -> Option<String> {
     let mut parts = path.trim_start_matches('/').splitn(3, '/');
     let owner = parts.next().filter(|s| !s.is_empty())?;
@@ -402,7 +402,7 @@ fn jq_extract(val: &serde_json::Value, expr: &str) -> String {
 }
 
 fn find_real_gh() -> String {
-    // Look for gh-real first (when ghp replaces /usr/bin/gh)
+    // Look for gh-real first (when obk replaces /usr/bin/gh)
     for dir in env::var("PATH").unwrap_or_default().split(':') {
         let candidate = format!("{}/gh-real", dir);
         if std::path::Path::new(&candidate).exists() {
@@ -557,7 +557,7 @@ mod git_credential_tests {
     #[test]
     fn test_plan_declines_unrecognized_hosts() {
         // Non-GitHub hosts decline quietly (exit 1) so other helpers can
-        // serve them — ghp claims no authority there.
+        // serve them — obk claims no authority there.
         for input in [
             "protocol=https\nhost=gitlab.com\npath=o/r.git\n",
             "protocol=https\nhost=gist.github.com\npath=abc123.git\n",
@@ -676,7 +676,7 @@ mod git_credential_tests {
 
     #[test]
     fn test_fetch_fails_closed_on_server_errors() {
-        // 403 from ghpool (policy denial) → None → caller emits quit=true
+        // 403 from octobroker (policy denial) → None → caller emits quit=true
         let base = mock_server(http_response("403 Forbidden", ""));
         assert_eq!(fetch_git_credential(&base, "o/r", "k"), None);
 

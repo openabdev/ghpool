@@ -1,8 +1,8 @@
 [package]
-name = "ghp"
+name = "obk"
 version = "0.1.1"
 edition = "2021"
-description = "gh CLI shim that routes read commands through ghpool"
+description = "gh CLI shim that routes read commands through octobroker"
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }

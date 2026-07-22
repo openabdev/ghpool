@@ -1,8 +1,8 @@
 [package]
-name = "ghpool"
+name = "octobroker"
 version = "0.6.0"
 edition = "2021"
-description = "Internal GitHub API proxy with PAT pooling and caching"
+description = "Secure GitHub gateway for AI agents — MCP, REST, and git push via short-lived, repo-scoped App tokens"
 license = "MIT"
 
 [dependencies]

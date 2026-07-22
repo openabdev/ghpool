@@ -1,13 +1,13 @@
-# ghpool
+# octobroker
 
-A secure, cloud-native GitHub gateway for AI coding agents: agents get GitHub's official MCP tools and REST reads **without holding any GitHub credential** — ghpool authenticates each agent, enforces per-agent default-deny tool/repo policy, and injects short-lived, repo-scoped GitHub App tokens upstream. Read caching and PAT pooling included for high-throughput REST traffic.
+A secure, cloud-native GitHub gateway for AI coding agents. Agents get GitHub's official MCP tools, REST/GraphQL reads, and even `git push` — **without holding a single GitHub credential**. octobroker authenticates each agent with a revocable key, enforces per-agent default-deny tool and repo policy, and mints short-lived, repo-scoped GitHub App tokens on demand — across multiple orgs from one endpoint. PAT pooling and read caching included for high-throughput REST traffic.
 
-> Design: [docs/DESIGN.md](docs/DESIGN.md) · Onboarding: [docs/getting-started.md](docs/getting-started.md) · RFC history: [#15](https://github.com/openabdev/ghpool/issues/15)
+> [octobroker.dev](https://octobroker.dev) · Design: [docs/DESIGN.md](docs/DESIGN.md) · Onboarding: [docs/getting-started.md](docs/getting-started.md) · RFC history: [#15](https://github.com/openabdev/octobroker/issues/15)
 
 ## Design Principles
 
-- **No GitHub credential on the agent** — agents hold at most a ghpool API key (revocable, policy-bounded, not a GitHub credential). The GitHub credentials live in exactly one place: ghpool.
-- **Default-deny policy engine** — each agent gets an exact tool allowlist and repository allowlist; new upstream tools are denied until explicitly granted. GitHub's own scoped installation tokens enforce the repo boundary independently of ghpool's parsing.
+- **No GitHub credential on the agent** — agents hold at most an octobroker API key (revocable, policy-bounded, not a GitHub credential). The GitHub credentials live in exactly one place: octobroker.
+- **Default-deny policy engine** — each agent gets an exact tool allowlist and repository allowlist; new upstream tools are denied until explicitly granted. GitHub's own scoped installation tokens enforce the repo boundary independently of octobroker's parsing.
 - **Short-lived credentials first** — GitHub App installation tokens (1h, auto-refreshed, repo-scoped at mint) are the recommended backend. Long-lived PAT pooling remains for REST read caching and legacy setups.
 - **Cloud-native** — runs on any Kubernetes (Amazon EKS, Google Cloud GKE, self-managed k8s) and Amazon ECS. Single static binary, no runtime dependencies.
 - **Secrets-first** — credentials are resolved at runtime from AWS Secrets Manager or Kubernetes secrets. No plain text tokens at rest.
@@ -27,10 +27,10 @@ A secure, cloud-native GitHub gateway for AI coding agents: agents get GitHub's 
 │                      │                                              │
 │                      ▼                                              │
 │           ┌──────────────────────────────────┐                      │
-│           │              ghpool              │                      │
+│           │              octobroker              │                      │
 │           │                                  │                      │
 │           │  ┌────────────────────────────┐  │                      │
-│           │  │ Agent authn (X-Ghpool-Key) │  │                      │
+│           │  │ Agent authn (X-Octobroker-Key) │  │                      │
 │           │  │ + default-deny policy      │  │  ┌────────────────┐  │
 │           │  │   tools / repos per agent  │  │  │ Secrets Manager│  │
 │           │  └────────────────────────────┘  │  │ (AWS/K8s/Env)  │  │
@@ -71,7 +71,7 @@ Request Flow:
 
   POST /mcp (opt-in; read-only by default, writes behind a hard gate)
     → MCP Streamable HTTP reverse proxy to GitHub's hosted MCP server
-    → authenticate agent (X-Ghpool-Key) → default-deny tool/repo policy
+    → authenticate agent (X-Octobroker-Key) → default-deny tool/repo policy
     → inject scoped GitHub App token (or pooled PAT), pin per session
     → audit-log every tools/call; writes fail-closed audited
 ```
@@ -107,9 +107,9 @@ curl http://localhost:8080/stats
 
 Config file search order:
 
-1. `GHPOOL_CONFIG` env var (explicit path — always wins)
+1. `OCTOBROKER_CONFIG` env var (explicit path — always wins)
 2. `./config.toml` (current directory)
-3. `$XDG_CONFIG_HOME/ghpool/config.toml` (defaults to `~/.config/ghpool/config.toml`)
+3. `$XDG_CONFIG_HOME/octobroker/config.toml` (defaults to `~/.config/octobroker/config.toml`)
 4. No file → environment variables only (see below)
 
 The loaded path is logged at startup. For configs in your home directory, prefer secret references (`env:`, `aws:secretsmanager:`, `k8s:`) over plain token literals.
@@ -132,24 +132,24 @@ The `token` field in `[[identities]]` supports multiple secret sources, so crede
 Store PATs as a JSON object in a single secret:
 
 ```sh
-aws secretsmanager create-secret --name ghpool/pats \
+aws secretsmanager create-secret --name octobroker/pats \
   --secret-string '{"pat_alice":"ghp_xxx","pat_bob":"ghp_yyy"}'
 ```
 
 ```toml
 [[identities]]
 id = "alice"
-token = "aws:secretsmanager:ghpool/pats:pat_alice"
+token = "aws:secretsmanager:octobroker/pats:pat_alice"
 ```
 
-ghpool uses the standard AWS credential chain (instance profile, ECS task role, SSO, env vars).
+octobroker uses the standard AWS credential chain (instance profile, ECS task role, SSO, env vars).
 
 #### Google Cloud Secret Manager (planned)
 
 ```toml
 [[identities]]
 id = "alice"
-token = "gcp:secretmanager:projects/my-proj/secrets/ghpool-pat:latest"
+token = "gcp:secretmanager:projects/my-proj/secrets/octobroker-pat:latest"
 ```
 
 GCP support is on the roadmap. Contributions welcome.
@@ -163,7 +163,7 @@ Mount your secret as a volume at `/etc/secrets/` and reference it:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: ghpool-pats
+  name: octobroker-pats
   namespace: default
 stringData:
   pat_alice: ghp_xxx
@@ -172,7 +172,7 @@ stringData:
 ```toml
 [[identities]]
 id = "alice"
-token = "k8s:default/ghpool-pats:pat_alice"
+token = "k8s:default/octobroker-pats:pat_alice"
 ```
 
 Works with any Kubernetes distribution — EKS, GKE, AKS, k3s, or self-managed.
@@ -180,35 +180,35 @@ Works with any Kubernetes distribution — EKS, GKE, AKS, k3s, or self-managed.
 ### Environment variables only
 
 ```sh
-export GHPOOL_PORT=8080
-export GHPOOL_ALLOWED_OWNERS=openclaw,openabdev
-export GHPOOL_PAT_ALICE=ghp_xxx
-export GHPOOL_PAT_BOB=ghp_yyy
+export OCTOBROKER_PORT=8080
+export OCTOBROKER_ALLOWED_OWNERS=openclaw,openabdev
+export OCTOBROKER_PAT_ALICE=ghp_xxx
+export OCTOBROKER_PAT_BOB=ghp_yyy
 ```
 
-PATs are discovered from any env var matching `GHPOOL_PAT_<ID>=<token>`.
+PATs are discovered from any env var matching `OCTOBROKER_PAT_<ID>=<token>`.
 
 ## Deployment
 
 ### Docker
 
 ```sh
-docker build -t ghpool .
-docker run -p 8080:8080 -v ./config.toml:/config.toml ghpool
+docker build -t octobroker .
+docker run -p 8080:8080 -v ./config.toml:/config.toml octobroker
 ```
 
 ### ECS (Service Connect)
 
 Deploy as a service in your ECS cluster with Cloud Map namespace. Other services access it via:
 ```
-http://ghpool.<namespace>:8080/repos/owner/repo/pulls/123
+http://octobroker.<namespace>:8080/repos/owner/repo/pulls/123
 ```
 
 ### Kubernetes
 
 Deploy as a ClusterIP Service. Other pods access it via:
 ```
-http://ghpool.<namespace>.svc.cluster.local:8080/repos/owner/repo/pulls/123
+http://octobroker.<namespace>.svc.cluster.local:8080/repos/owner/repo/pulls/123
 ```
 
 ## API
@@ -230,7 +230,7 @@ POST /graphql
 - **Queries** — routed through pooled PATs, responses cached
 - **Mutations** — client's own `Authorization` header passed through to GitHub (no pooling, no caching)
 
-If a mutation request has no `Authorization` header, ghpool returns `401`.
+If a mutation request has no `Authorization` header, octobroker returns `401`.
 
 ```
   ┌────────────────────────────────────────────────────────────────┐
@@ -266,15 +266,15 @@ If a mutation request has no `Authorization` header, ghpool returns `401`.
 
 ### MCP (POST/GET/DELETE /mcp) — opt-in
 
-Reverse proxy to [GitHub's hosted MCP server](https://github.com/github/github-mcp-server): agents connect a Model Context Protocol client to ghpool and get GitHub's official MCP tools — **with no GitHub credential on the agent**. ghpool strips any client `Authorization` header and injects a pooled credential upstream.
+Reverse proxy to [GitHub's hosted MCP server](https://github.com/github/github-mcp-server): agents connect a Model Context Protocol client to octobroker and get GitHub's official MCP tools — **with no GitHub credential on the agent**. octobroker strips any client `Authorization` header and injects a pooled credential upstream.
 
-> **Status: writes available behind a hard gate.** Read-only by default; `enable_writes` unlocks write tools for authenticated agents only, and requires the GitHub App backend plus fail-closed audit (validated at startup). See the [RFC](https://github.com/openabdev/ghpool/issues/15).
+> **Status: writes available behind a hard gate.** Read-only by default; `enable_writes` unlocks write tools for authenticated agents only, and requires the GitHub App backend plus fail-closed audit (validated at startup). See the [RFC](https://github.com/openabdev/octobroker/issues/15).
 
 ```
 ┌───────────────── Private Network / VPC ─────────────────┐
 │                                                         │
 │  ┌───────────────────┐         ┌────────────────────┐   │
-│  │  MCP client       │         │  ghpool            │   │
+│  │  MCP client       │         │  octobroker            │   │
 │  │  (agent)          │  MCP    │                    │   │
 │  │                   │ ──────► │  1. strip client   │   │
 │  │  no GitHub        │  HTTP   │     Authorization  │   │
@@ -293,7 +293,7 @@ Reverse proxy to [GitHub's hosted MCP server](https://github.com/github/github-m
                             └──────────────────────────────┘
 ```
 
-Enable it in `config.toml` (or `GHPOOL_MCP_ENABLED=true`):
+Enable it in `config.toml` (or `OCTOBROKER_MCP_ENABLED=true`):
 
 ```toml
 [mcp]
@@ -317,15 +317,15 @@ Add `[[mcp.agents]]` entries to require an API key on every `/mcp` request and e
 ```toml
 [[mcp.agents]]
 id = "openab-bot"
-key = "aws:secretsmanager:ghpool/mcp-keys:openab"   # env:/k8s: refs also work
+key = "aws:secretsmanager:octobroker/mcp-keys:openab"   # env:/k8s: refs also work
 tools = ["issue_read", "list_issues", "pull_request_read"]
 ```
 
-- With any agent configured, requests without a valid `X-Ghpool-Key` get `401`; a `tools/call` for a tool not on the agent's allowlist gets `403` at the proxy — it never reaches GitHub. The allowlist is also injected upstream as `X-MCP-Tools`, so `tools/list` natively shows the agent only its permitted tools.
+- With any agent configured, requests without a valid `X-Octobroker-Key` get `401`; a `tools/call` for a tool not on the agent's allowlist gets `403` at the proxy — it never reaches GitHub. The allowlist is also injected upstream as `X-MCP-Tools`, so `tools/list` natively shows the agent only its permitted tools.
 - New upstream tools are **denied by default** until added to an agent's `tools` list.
-- The key is a **ghpool credential, not a GitHub credential** — a leak is bounded by that agent's allowlist and revoked by editing ghpool config, without touching GitHub.
+- The key is a **octobroker credential, not a GitHub credential** — a leak is bounded by that agent's allowlist and revoked by editing octobroker config, without touching GitHub.
 - Audit lines include the agent: `MCP tools/call issue_read [agent=openab-bot via alice] [session=…]`.
-- Terminate TLS in front of ghpool (ALB, ingress, mesh) in production — the key travels in a header.
+- Terminate TLS in front of octobroker (ALB, ingress, mesh) in production — the key travels in a header.
 
 Client config gains one line:
 
@@ -333,14 +333,14 @@ Client config gains one line:
 {
   "mcpServers": {
     "github": {
-      "url": "http://ghpool.<namespace>:8080/mcp",
-      "headers": { "X-Ghpool-Key": "${GHPOOL_KEY}" }
+      "url": "http://octobroker.<namespace>:8080/mcp",
+      "headers": { "X-Octobroker-Key": "${OCTOBROKER_KEY}" }
     }
   }
 }
 ```
 
-Deliver `GHPOOL_KEY` to the agent container via ECS task secrets / K8s Secrets — most MCP clients expand `${ENV}` in config.
+Deliver `OCTOBROKER_KEY` to the agent container via ECS task secrets / K8s Secrets — most MCP clients expand `${ENV}` in config.
 
 #### Write access (Phase 2b)
 
@@ -352,59 +352,59 @@ enable_writes = true          # startup FAILS unless all three sections below ex
 
 [mcp.github_app]              # writes never run on pooled PATs
 app_id = "123456"
-private_key = "aws:secretsmanager:ghpool/app:private_key"
+private_key = "aws:secretsmanager:octobroker/app:private_key"
 owner = "openabdev"
 
 [mcp.audit]                   # writes are fail-closed audited
-path = "/var/lib/ghpool/mcp-audit.jsonl"
+path = "/var/lib/octobroker/mcp-audit.jsonl"
 
 [[mcp.agents]]                # writes are only for authenticated agents
 id = "openab-bot"
-key = "aws:secretsmanager:ghpool/mcp-keys:openab"
-tools = ["issue_read", "create_issue", "add_issue_comment", "ghpool_review_minimize_comment"]
-repos = ["openabdev/ghpool", "openabdev/openab"]
+key = "aws:secretsmanager:octobroker/mcp-keys:openab"
+tools = ["issue_read", "create_issue", "add_issue_comment", "octobroker_review_minimize_comment"]
+repos = ["openabdev/octobroker", "openabdev/openab"]
 ```
 
 How the write path is bounded:
 
 - **Default-deny stack**: agent key → tool allowlist → write classification → repo allowlist (deny-if-unresolvable) → per-agent in-flight cap → fail-closed audit record → forward.
-- **Scoped credentials**: when an agent's `repos` are all exact entries under one owner, its installation token is minted with the API's `repositories` parameter — **GitHub itself enforces the repo boundary**, independent of ghpool's argument parsing. Wildcard or mixed-owner allowlists fall back to an installation-wide token (proxy-side checks still apply).
+- **Scoped credentials**: when an agent's `repos` are all exact entries under one owner, its installation token is minted with the API's `repositories` parameter — **GitHub itself enforces the repo boundary**, independent of octobroker's argument parsing. Wildcard or mixed-owner allowlists fall back to an installation-wide token (proxy-side checks still apply).
 - **Audit**: two fsync'd JSONL records per write (pre-flight + result). The result captures the MCP tool outcome (`result.isError`) — HTTP 200 alone is not treated as success. If the pre-flight record cannot be persisted, the write is rejected (503) without reaching GitHub. Argument values are never recorded.
-- **No auto-retry**: ghpool never retries a forwarded call; an ambiguous write outcome (e.g. connection lost mid-response) is recorded as undeterminable and surfaced to the client — retry decisions belong to the caller.
-- **Revocation**: session pins live in process memory; key rotation uses dual `keys`, and any config change (agent disabled, policy tightened) takes effect by restart, which clears all sessions. Upstream session DELETE is a no-op at GitHub — ghpool's pin cache is the session authority.
+- **No auto-retry**: octobroker never retries a forwarded call; an ambiguous write outcome (e.g. connection lost mid-response) is recorded as undeterminable and surfaced to the client — retry decisions belong to the caller.
+- **Revocation**: session pins live in process memory; key rotation uses dual `keys`, and any config change (agent disabled, policy tightened) takes effect by restart, which clears all sessions. Upstream session DELETE is a no-op at GitHub — octobroker's pin cache is the session authority.
 
 Required GitHub App permissions (grant only what your agents' tools need):
 
 | Tools | App permission |
 |-------|----------------|
 | `issue_read`, `list_issues`, `create_issue`, `add_issue_comment` | Issues: read / write |
-| `ghpool_review_minimize_comment` | Issues: write and Pull requests: write |
+| `octobroker_review_minimize_comment` | Issues: write and Pull requests: write |
 | `pull_request_read`, `create_pull_request`, `merge_pull_request` | Pull requests: read / write |
 | `get_file_contents`, `create_or_update_file`, `push_files` | Contents: read / write |
 | `list_workflows`, `run_workflow` | Actions: read / write |
 
 
-#### ghpool-owned review tools (issue #44 MVP)
+#### octobroker-owned review tools (issue #44 MVP)
 
 When writes are enabled and an authenticated agent explicitly includes the tool in its allowlist, `tools/list` also advertises it. For example:
 
 ```toml
 [[mcp.agents]]
 id = "review-bot"
-key = "env:GHPOOL_REVIEW_KEY"
-tools = ["issue_read", "list_issues", "ghpool_review_minimize_comment"]
-repos = ["openabdev/ghpool"]
+key = "env:OCTOBROKER_REVIEW_KEY"
+tools = ["issue_read", "list_issues", "octobroker_review_minimize_comment"]
+repos = ["openabdev/octobroker"]
 ```
 
-The tool accepts `owner`, `repo`, `node_id`, and a `classifier` (`ABUSE`, `DUPLICATE`, `OFF_TOPIC`, `OUTDATED`, `RESOLVED`, or `SPAM`). It supports issue and pull-request comments authored by the current GitHub App bot identity; it does not minimize human-authored comments or unsupported node types. Before mutating, it verifies both the App-bot author and the exact repository owner/name against the policy arguments, then executes GitHub's `minimizeComment` GraphQL mutation locally through ghpool's scoped GitHub App credential. The operation is not forwarded to the upstream MCP server. The call uses the same repository policy, write gate, in-flight limit, and fail-closed audit as upstream write tools. Agents that do not explicitly allowlist the name, or that have writes disabled, neither see it in `tools/list` nor can call it.
+The tool accepts `owner`, `repo`, `node_id`, and a `classifier` (`ABUSE`, `DUPLICATE`, `OFF_TOPIC`, `OUTDATED`, `RESOLVED`, or `SPAM`). It supports issue and pull-request comments authored by the current GitHub App bot identity; it does not minimize human-authored comments or unsupported node types. Before mutating, it verifies both the App-bot author and the exact repository owner/name against the policy arguments, then executes GitHub's `minimizeComment` GraphQL mutation locally through octobroker's scoped GitHub App credential. The operation is not forwarded to the upstream MCP server. The call uses the same repository policy, write gate, in-flight limit, and fail-closed audit as upstream write tools. Agents that do not explicitly allowlist the name, or that have writes disabled, neither see it in `tools/list` nor can call it.
 
-This is intentionally a narrow MVP: ghpool does not expose arbitrary GraphQL, and upstream GitHub MCP tools remain unchanged. Any future ghpool-owned tool must preserve the same explicit allowlist, repository binding, write gate, and audit requirements.
+This is intentionally a narrow MVP: octobroker does not expose arbitrary GraphQL, and upstream GitHub MCP tools remain unchanged. Any future octobroker-owned tool must preserve the same explicit allowlist, repository binding, write gate, and audit requirements.
 
-The tool surface returned by `tools/list` shrinks to match the App's actual permissions (verified in the [#22 spike](https://github.com/openabdev/ghpool/issues/22)) — grant conservatively and expand as agents need more.
+The tool surface returned by `tools/list` shrinks to match the App's actual permissions (verified in the [#22 spike](https://github.com/openabdev/octobroker/issues/22)) — grant conservatively and expand as agents need more.
 
 #### Multi-installation routing (one key, many orgs)
 
-One agent, one `X-Ghpool-Key`, one MCP server entry — repositories in several
+One agent, one `X-Octobroker-Key`, one MCP server entry — repositories in several
 organizations. Replace the singular `[mcp.github_app]` with one
 `[[mcp.github_apps]]` entry per installation (the same App installed in each
 org, or one App per org):
@@ -412,19 +412,19 @@ org, or one App per org):
 ```toml
 [[mcp.github_apps]]
 app_id = "123456"
-private_key = "aws:secretsmanager:ghpool/app:private_key"
+private_key = "aws:secretsmanager:octobroker/app:private_key"
 owner = "openabdev"            # routing key — unique per entry
 installation_id = 11111111     # recommended: skip discovery
 
 [[mcp.github_apps]]
 app_id = "123456"
-private_key = "aws:secretsmanager:ghpool/app:private_key"
+private_key = "aws:secretsmanager:octobroker/app:private_key"
 owner = "oablab"
 installation_id = 22222222
 
 [[mcp.agents]]
 id = "b0"
-key = "aws:secretsmanager:ghpool/mcp-keys:b0"
+key = "aws:secretsmanager:octobroker/mcp-keys:b0"
 tools = ["issue_read", "list_issues", "create_issue", "add_issue_comment"]
 repos = ["openabdev/openab", "oablab/chi"]   # owners select the installations
 ```
@@ -450,7 +450,7 @@ tools/call {owner: "oablab", …}    → session B (oablab token)
   any upstream sessions already opened are cleaned up (best-effort DELETE).
   Tokens are never mixed within one upstream session, preserving the pinning
   invariant per installation.
-- **One downstream session** — the client sees a single session ID; ghpool
+- **One downstream session** — the client sees a single session ID; octobroker
   maps it to the per-installation upstream sessions. `DELETE` and
   `notifications/*` fan out to every route (best-effort for secondaries).
   When a pinned token expires the session gets 404 and the client
@@ -481,7 +481,7 @@ per-org blast-radius isolation.
 
 MCP covers issues and PRs, but `git push` speaks the Git protocol — it needs
 a real credential at push time. `enable_git_credentials` lets a
-repository-scoped agent exchange its ghpool key for a **short-lived,
+repository-scoped agent exchange its octobroker key for a **short-lived,
 single-repo** App installation token, eliminating the last long-lived GitHub
 credential in the agent container:
 
@@ -496,22 +496,22 @@ the singular `[mcp.github_app]` form, `owner` is **required** when git
 credentials are enabled — the explicit `installation_id` is verified against
 the installation's actual account before any token is issued.
 
-Agent side, `ghp` doubles as a standard git credential helper. Register it
+Agent side, `obk` doubles as a standard git credential helper. Register it
 as the **only** helper for `github.com` — `--replace-all` with an empty
 first entry clears any inherited helpers (osxkeychain, GCM, `gh auth
 git-credential`) that would otherwise supply broader credentials:
 
 ```sh
 git config --global --replace-all credential."https://github.com".helper ""
-git config --global --add credential."https://github.com".helper "!ghp git-credential"
+git config --global --add credential."https://github.com".helper "!obk git-credential"
 git config --global credential."https://github.com".useHttpPath true
 ```
 
 Every `git push` then flows:
 
 ```
-git push → ghp git-credential (GHPOOL_KEY from env)
-         → GET /git-credential?repo=owner/name   (X-Ghpool-Key)
+git push → obk git-credential (OCTOBROKER_KEY from env)
+         → GET /git-credential?repo=owner/name   (X-Octobroker-Key)
          → key auth → repo allowlist → installation routing
          → durable audit preflight (phase: git_credential_request)
          → installation owner verified against GitHub
@@ -537,8 +537,8 @@ Properties:
 - **Deny-by-default** — repo-less agents, off-allowlist repos, and owners
   without an installation are refused before any mint.
 - **Fail-closed helper** — once a request is recognized as `github.com`
-  HTTPS, any failure (missing `GHPOOL_KEY`, missing path, policy denial,
-  network error) makes `ghp` emit `quit=true`, telling git to stop the
+  HTTPS, any failure (missing `OCTOBROKER_KEY`, missing path, policy denial,
+  network error) makes `obk` emit `quit=true`, telling git to stop the
   helper cascade instead of falling through to broader stored credentials
   or prompting. Non-GitHub hosts are declined quietly so other helpers can
   serve them. `gist.github.com` is not supported.
@@ -549,7 +549,7 @@ Deployment notes:
 
 - Requires egress to `api.githubcopilot.com` (the only additional external dependency).
 - Run a **single replica** while MCP is enabled — session pins live in process memory. A rolling deploy terminates sessions; clients recover by re-initializing.
-- Inside a trusted network, any workload that can reach `/mcp` gets the same read-only access (same trust model as ghpool's REST reads). Put TLS and agent authentication in front before any write-capable phase.
+- Inside a trusted network, any workload that can reach `/mcp` gets the same read-only access (same trust model as octobroker's REST reads). Put TLS and agent authentication in front before any write-capable phase.
 - If the hosted endpoint is unreachable from your network, point `upstream` at a self-hosted [`github-mcp-server`](https://github.com/github/github-mcp-server) instead — same protocol and headers.
 
 ### Management
@@ -561,30 +561,30 @@ Deployment notes:
 
 ## How clients use it
 
-### ghp CLI (recommended)
+### obk CLI (recommended)
 
-`ghp` is a drop-in `gh` shim that routes read commands through ghpool's REST API (pooled + cached) and falls through to the real `gh` for writes.
+`obk` is a drop-in `gh` shim that routes read commands through octobroker's REST API (pooled + cached) and falls through to the real `gh` for writes.
 
 ```sh
-export GHPOOL_URL=http://ghpool.openab.local:8080
+export OCTOBROKER_URL=http://octobroker.openab.local:8080
 
-# Reads — through ghpool (pooled + cached)
-ghp api repos/org/repo --jq .stargazers_count
-ghp issue list -R org/repo -L 10
-ghp pr list -R org/repo
-ghp pr view 123 -R org/repo
-ghp run list -R org/repo
+# Reads — through octobroker (pooled + cached)
+obk api repos/org/repo --jq .stargazers_count
+obk issue list -R org/repo -L 10
+obk pr list -R org/repo
+obk pr view 123 -R org/repo
+obk run list -R org/repo
 
 # Writes — falls through to real gh (direct to GitHub)
-ghp issue create -R org/repo -t "title" -b "body"
-ghp issue comment 123 -R org/repo -b "comment"
-ghp pr create -R org/repo -t "title" -b "body"
+obk issue create -R org/repo -t "title" -b "body"
+obk issue comment 123 -R org/repo -b "comment"
+obk pr create -R org/repo -t "title" -b "body"
 ```
 
 To replace `gh` transparently:
 
 ```sh
-ln -sf $(which ghp) ~/bin/gh
+ln -sf $(which obk) ~/bin/gh
 export PATH=~/bin:$PATH
 ```
 
@@ -594,11 +594,11 @@ export PATH=~/bin:$PATH
 export GITHUB_API_URL=http://localhost:8080
 ```
 
-REST calls (`gh api repos/...`) route through ghpool. Note: `gh` CLI's built-in commands (`gh issue list`, `gh pr list`) use GraphQL internally and bypass `GITHUB_API_URL` — use `ghp` for full coverage.
+REST calls (`gh api repos/...`) route through octobroker. Note: `gh` CLI's built-in commands (`gh issue list`, `gh pr list`) use GraphQL internally and bypass `GITHUB_API_URL` — use `obk` for full coverage.
 
 ### Coding agents
 
-Set the GitHub API base URL to point at ghpool:
+Set the GitHub API base URL to point at octobroker:
 
 ```sh
 export GITHUB_API_BASE=http://localhost:8080
@@ -606,7 +606,7 @@ export GITHUB_API_BASE=http://localhost:8080
 
 ### MCP clients (agents)
 
-Point any Streamable-HTTP MCP client at ghpool — no GitHub token, no `gh` CLI, no git credentials in the agent container.
+Point any Streamable-HTTP MCP client at octobroker — no GitHub token, no `gh` CLI, no git credentials in the agent container.
 
 Kiro CLI (`~/.kiro/settings/mcp.json`) and most JSON-configured clients:
 
@@ -614,7 +614,7 @@ Kiro CLI (`~/.kiro/settings/mcp.json`) and most JSON-configured clients:
 {
   "mcpServers": {
     "github": {
-      "url": "http://ghpool.<namespace>:8080/mcp"
+      "url": "http://octobroker.<namespace>:8080/mcp"
     }
   }
 }
@@ -623,19 +623,19 @@ Kiro CLI (`~/.kiro/settings/mcp.json`) and most JSON-configured clients:
 Claude Code:
 
 ```sh
-claude mcp add --transport http github http://ghpool.<namespace>:8080/mcp
+claude mcp add --transport http github http://octobroker.<namespace>:8080/mcp
 ```
 
 Verify from the container (no `Authorization` header anywhere):
 
 ```sh
-curl -s -X POST http://ghpool:8080/mcp \
+curl -s -X POST http://octobroker:8080/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' -i | grep -i mcp-session-id
 ```
 
-In Phase 2, agents will additionally present a ghpool API key (`X-Ghpool-Key` header from an env-injected secret) mapped to a per-agent tool/repo allowlist — see [#17](https://github.com/openabdev/ghpool/issues/17).
+In Phase 2, agents will additionally present an octobroker API key (`X-Octobroker-Key` header from an env-injected secret) mapped to a per-agent tool/repo allowlist — see [#17](https://github.com/openabdev/octobroker/issues/17).
 
 ### Direct curl
 
